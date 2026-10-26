@@ -1,0 +1,3 @@
+{"name": "t3_defend", "npz": "docs/results/blender_viz/data/t3_defend_rl_sparse_s2_stage2_seed7.npz", "env": 0,
+ "title": "T3 Defend - RL defenders (MAPPO sparse, stage-2 gate pass) vs scripted attackers",
+ "trails": "history", "speed": 1.0, "grid": 1.0, "proximity_lines": false, "proximity_radius": 1.0}

@@ -1,0 +1,10 @@
+{
+ "name": "t2_waypoint",
+ "npz": "docs/results/ws_basic/waypoint_fixed_best_agent.npz",
+ "env": 0,
+ "title": "T2 Waypoint - RL policy chasing a moving goal",
+ "trails": "history",
+ "speed": 1.0,
+ "grid": 0.5,
+ "fit_ground": false
+}

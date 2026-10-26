@@ -1,0 +1,1573 @@
+# upstream_mods.patch
+# Diffs for organizer files modified by team4 vs upstream/main.
+# Upstream commit: cd6536a458c3ba034a727ea00f57adac6bed9471 (https://github.com/jaromero3rd/Action_Space)
+# Apply with:
+#   git apply --3way upstream_mods.patch
+# from the root of a checkout of the organizer repo at that commit.
+#
+diff --git a/simulation_infra/scripts/evaluate.py b/simulation_infra/scripts/evaluate.py
+index e19ab6c..5622ae8 100644
+--- a/simulation_infra/scripts/evaluate.py
++++ b/simulation_infra/scripts/evaluate.py
+@@ -26,9 +26,25 @@ parser.add_argument(
+     "--baseline",
+     type=str,
+     default=None,
+-    choices=["zero", "chase"],
+-    help="Evaluate a scripted baseline instead of a checkpoint: zero does nothing, chase pursues the nearest attacker.",
++    choices=["zero", "chase", "lead", "assign-chase", "assign-lead", "assign-lead-safe", "assign-guard-safe", "random", "flee", "dive", "spin", "obs-chase"],
++    help=(
++        "Evaluate a scripted baseline instead of a checkpoint: zero does nothing, chase pursues the nearest attacker, "
++        "random samples uniform actions, flee flies away from the site, dive flies into the ground, spin yaws in place "
++        "(the last four are reward-exploit probes: none may beat zero). assign-lead-safe adds teammate repulsion "
++        "inside 0.8 m (the hardware fallback; scripted drones otherwise ram each other). assign-guard-safe is a goalkeeper: "
++        "wait on the attacker->site line 2.5 m out, ram once the attacker is within 1 m (for attackers faster than us). obs-chase is the old chase that read the obs "
++        "(it targets zeroed dead slots, kept only for comparison). "
++        "lead flies at the nearest attacker's intercept point, assign-* first splits attackers between defenders "
++        "(brute-force assignment minimising the slowest intercept, then the total) and chases / leads its own target."
++    ),
+ )
++parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
++                    help="Env cfg overrides, python literals, e.g. --set attacker_speed=[0.8,1.2] attacker_evasion=1.0")
++parser.add_argument("--seed", type=int, default=42, help="Env seed.")
++parser.add_argument("--traj", type=str, default=None,
++                    help="Save positions of the first --traj_envs envs to this .npz (render with scripts/render_defend_traj.py).")
++parser.add_argument("--traj_envs", type=int, default=4)
++parser.add_argument("--traj_seconds", type=float, default=20.0)
+ parser.add_argument("--algorithm", type=str, default="IPPO", choices=["IPPO", "MAPPO"], help="Algorithm of the checkpoint.")
+ parser.add_argument("--video", action="store_true", default=False, help="Record a video of the run.")
+ parser.add_argument("--video_length", type=int, default=400, help="Video length in steps.")
+@@ -49,8 +65,29 @@ import action_space_kit.tasks  # noqa: F401
+ from isaaclab_tasks.utils import parse_env_cfg
+ 
+ 
++def probe_actions(raw, kind):
++    """Deliberately bad policies for the reward-ordering table (docs/TRAINING_PLAN.md §4)."""
++    E, dev = raw.num_envs, raw.device
++    actions = {}
++    for i, agent in enumerate(raw.cfg.possible_agents):
++        a = torch.zeros(E, 4, device=dev)
++        if kind == "random":
++            a = torch.rand(E, 4, device=dev) * 2.0 - 1.0
++        elif kind == "flee":
++            away = raw._defenders[i].data.root_pos_w - raw.scene.env_origins
++            away[:, 2] = 0.0
++            a[:, :3] = away / torch.clamp(torch.linalg.norm(away, dim=-1, keepdim=True), min=1e-6)
++        elif kind == "dive":
++            a[:, 2] = -1.0
++        elif kind == "spin":
++            a[:, 3] = 1.0
++        actions[agent] = a
++    return actions
++
++
+ def chase_actions(raw, obs):
+-    """Head straight at the nearest tracked attacker -- the baseline to beat."""
++    """OLD obs-based chase. Bug kept for reference: dead slots are zeroed in the obs, so after the first
++    kill argmin picks a dead slot at distance 0 and the defender hovers. Use --baseline chase (state-based)."""
+     actions = {}
+     num_attackers = raw.cfg.num_attackers
+     for agent in raw.cfg.possible_agents:
+@@ -62,8 +99,117 @@ def chase_actions(raw, obs):
+     return actions
+ 
+ 
++def _intercept(rel, v_att, speed):
++    """Time and aim point to reach a constant-velocity target at `speed` (rel = target - self).
++
++    Solves |rel + v_att t| = speed t for the smallest t > 0; falls back to the target's current
++    position (t = |rel| / speed) when the target is too fast to catch.
++    """
++    a = (v_att * v_att).sum(-1) - speed**2
++    b = 2.0 * (rel * v_att).sum(-1)
++    c = (rel * rel).sum(-1)
++    direct = torch.sqrt(c) / speed
++    disc = b * b - 4.0 * a * c
++    sq = torch.sqrt(torch.clamp(disc, min=0.0))
++    safe_a = torch.where(a.abs() < 1e-6, torch.full_like(a, -1e-6), a)
++    t1, t2 = (-b - sq) / (2.0 * safe_a), (-b + sq) / (2.0 * safe_a)
++    big = torch.full_like(t1, float("inf"))
++    t = torch.minimum(torch.where(t1 > 0, t1, big), torch.where(t2 > 0, t2, big))
++    ok = (disc >= 0) & torch.isfinite(t)
++    t = torch.where(ok, t, direct)
++    aim = torch.where(ok.unsqueeze(-1), rel + v_att * t.unsqueeze(-1), rel)
++    return t, aim
++
++
++def _assignments(num_defenders, num_attackers, device):
++    """Every defender->attacker mapping (with repeats), shape (K, num_defenders)."""
++    import itertools
++
++    return torch.tensor(list(itertools.product(range(num_attackers), repeat=num_defenders)), device=device)
++
++
++def scripted_actions(raw, kind):
++    """Scripted defenders from simulator state (what a tag localizer + tracker would provide)."""
++    speed = raw.cfg.command.max_lin_speed
++    att_pos, att_vel = raw._attacker_states()
++    alive = raw._attacker_alive  # (E, A)
++    E, A = alive.shape
++    D = raw.cfg.num_defenders
++    def_pos = torch.stack([d.data.root_pos_w for d in raw._defenders], dim=1)  # (E, D, 3)
++    rel = att_pos.unsqueeze(1) - def_pos.unsqueeze(2)  # (E, D, A, 3)
++    safe = kind.endswith("-safe")
++    kind = kind.removesuffix("-safe")
++    guard = kind == "assign-guard"
++    lead = kind in ("lead", "assign-lead", "assign-guard")
++    if lead:
++        ttg, aim = _intercept(rel, att_vel.unsqueeze(1).expand_as(rel), speed)
++    else:
++        ttg, aim = torch.linalg.norm(rel, dim=-1) / speed, rel
++    dead = ~alive.unsqueeze(1).expand(E, D, A)
++    ttg = torch.where(dead, torch.full_like(ttg, 1e4), ttg)
++
++    if kind.startswith("assign"):
++        combos = _assignments(D, A, raw.device)  # (K, D)
++        K = combos.shape[0]
++        cost_per = torch.gather(ttg.unsqueeze(1).expand(E, K, D, A), 3, combos.view(1, K, D, 1).expand(E, K, D, 1)).squeeze(-1)
++        # distinct targets used vs how many could be covered: every duplicate while a live attacker is unmatched is penalised
++        onehot = torch.nn.functional.one_hot(combos, A).sum(1).clamp(max=1)  # (K, A)
++        covered = (onehot.unsqueeze(0) * alive.unsqueeze(1)).sum(-1)  # (E, K)
++        need = torch.minimum(alive.sum(-1, keepdim=True), torch.tensor(D, device=raw.device))
++        cost = cost_per.max(-1).values + 0.01 * cost_per.sum(-1) + 1e3 * (need - covered).clamp(min=0)
++        target = combos[cost.argmin(-1)]  # (E, D)
++    else:
++        target = ttg.argmin(-1)  # (E, D) nearest / soonest live attacker
++
++    if guard:
++        # goalkeeper: stand on the attacker->site line at guard_r, ram (lead) once the attacker is within 1 m of that spot
++        site = raw.scene.env_origins.clone()
++        site[:, 2] += raw.cfg.site_height * 0.5
++        guard_r = 2.5
++        out = att_pos - site.unsqueeze(1)  # (E, A, 3)
++        out_xy = out.clone()
++        out_xy[..., 2] = 0.0
++        unit = out_xy / torch.clamp(torch.linalg.norm(out_xy, dim=-1, keepdim=True), min=1e-6)
++        gpt = site.unsqueeze(1) + unit * guard_r
++        gpt[..., 2] = att_pos[..., 2]
++        to_guard = gpt.unsqueeze(1) - def_pos.unsqueeze(2)  # (E, D, A, 3)
++        near = (torch.linalg.norm(att_pos - gpt, dim=-1) < 1.0) | (torch.linalg.norm(out_xy, dim=-1) < guard_r)
++        aim = torch.where(near.unsqueeze(1).unsqueeze(-1), aim, to_guard)
++        # slow down when already on the spot (don't overshoot)
++    actions = {}
++    def_alive = getattr(raw, "_defender_alive", torch.ones(E, D, dtype=torch.bool, device=raw.device))
++    for i, agent in enumerate(raw.cfg.possible_agents):
++        a = aim[torch.arange(E, device=raw.device), i, target[:, i]]
++        n = torch.linalg.norm(a, dim=-1, keepdim=True)
++        if guard:
++            # holding the spot: proportional within 0.5 m (no oscillation); ramming: always full speed
++            ramming = near[torch.arange(E, device=raw.device), target[:, i]].unsqueeze(-1)
++            direction = a / torch.where(ramming, n.clamp(min=1e-6), n.clamp(min=0.5))
++        else:
++            direction = a / torch.clamp(n, min=1e-6)
++        if safe:
++            # push away from live teammates closer than 0.8 m (stronger the closer), then renormalise
++            for j in range(D):
++                if j == i:
++                    continue
++                away = def_pos[:, i] - def_pos[:, j]
++                d = torch.linalg.norm(away, dim=-1, keepdim=True).clamp(min=1e-3)
++                w = (2.0 * (0.8 - d) / 0.8).clamp(min=0.0) * def_alive[:, j:j + 1].float()
++                direction = direction + w * away / d
++            direction = direction / torch.clamp(torch.linalg.norm(direction, dim=-1, keepdim=True), min=1.0)
++        actions[agent] = torch.cat([direction, torch.zeros(E, 1, device=raw.device)], dim=-1)
++    return actions
++
++
+ def main():
++    import ast
++
+     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
++    env_cfg.seed = args_cli.seed
++    for kv in args_cli.set:
++        key, value = kv.split("=", 1)
++        setattr(env_cfg, key, ast.literal_eval(value))
++        print(f"[evaluate] override {key} = {getattr(env_cfg, key)}", flush=True)
+     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+     if args_cli.video:
+         import os
+@@ -105,8 +251,14 @@ def main():
+     alive_prev = raw._attacker_alive.clone()
+     step_in_episode = torch.zeros(raw.num_envs, device=raw.device)
+     episode_intercept_times: list[list[float]] = [[] for _ in range(raw.num_envs)]
++    closest = torch.full((raw.num_envs,), float("inf"), device=raw.device)
++    traj = {"defenders": [], "attackers": [], "alive": []} if args_cli.traj else None
++    traj_steps = int(args_cli.traj_seconds / raw.step_dt)
++    closest_done: list[float] = []
++    captures_per_episode: list[float] = []
++    stat_sums: dict[str, float] = {}
+ 
+-    while episodes < args_cli.episodes:
++    while episodes < args_cli.episodes or (traj is not None and len(traj["alive"]) < traj_steps):
+         if policy is not None:
+             with torch.inference_mode():
+                 # multi-agent skrl agents take and return dicts keyed by agent, and
+@@ -116,13 +268,36 @@ def main():
+                 actions = {
+                     a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in raw.cfg.possible_agents
+                 }
+-        elif args_cli.baseline == "chase":
++        elif args_cli.baseline == "obs-chase":
+             actions = chase_actions(raw, obs)
++        elif args_cli.baseline in ("random", "flee", "dive", "spin"):
++            actions = probe_actions(raw, args_cli.baseline)
++        elif args_cli.baseline in ("chase", "lead", "assign-chase", "assign-lead", "assign-lead-safe", "assign-guard-safe"):
++            actions = scripted_actions(raw, args_cli.baseline)
+         else:
+             actions = {a: torch.zeros(raw.num_envs, 4, device=raw.device) for a in raw.cfg.possible_agents}
+ 
+         obs, _, terminated, truncated, _ = env.step(actions)
+         step_in_episode += 1
++        att_pos, _ = raw._attacker_states()
++        radial = torch.linalg.norm(att_pos[:, :, :2] - raw.scene.env_origins[:, :2].unsqueeze(1), dim=-1)
++        radial = torch.where(raw._attacker_alive, radial, torch.full_like(radial, float("inf")))
++        closest = torch.minimum(closest, radial.min(dim=-1).values)
++        if traj is not None and len(traj["alive"]) < traj_steps:
++            k = min(args_cli.traj_envs, raw.num_envs)
++            org = raw.scene.env_origins[:k].unsqueeze(1)
++            traj["defenders"].append((torch.stack([d.data.root_pos_w[:k] for d in raw._defenders], 1) - org).cpu())
++            traj["attackers"].append((att_pos[:k] - org).cpu())
++            traj["alive"].append(raw._attacker_alive[:k].cpu())
++            if len(traj["alive"]) == traj_steps:
++                import numpy as np, os
++                os.makedirs(os.path.dirname(os.path.abspath(args_cli.traj)), exist_ok=True)
++                np.savez_compressed(args_cli.traj, defenders=torch.stack(traj["defenders"], 1).numpy(),
++                                    attackers=torch.stack(traj["attackers"], 1).numpy(), alive=torch.stack(traj["alive"], 1).numpy(),
++                                    dt=raw.step_dt, site_radius=raw.cfg.site_radius, capture_radius=raw.cfg.capture_radius,
++                                    spawn_radius=raw.cfg.spawn_radius, label=args_cli.checkpoint or args_cli.baseline or "zero",
++                                    overrides=" ".join(args_cli.set))
++                print(f"[evaluate] wrote trajectories {args_cli.traj}", flush=True)
+ 
+         newly_down = alive_prev & ~raw._attacker_alive
+         if newly_down.any():
+@@ -137,12 +312,17 @@ def main():
+             breaches += int(raw.outcome_breached[finished].sum().item())
+             intercepted += int(raw.outcome_captures[finished].sum().item())
+             attacker_slots += len(finished) * raw.cfg.num_attackers
++            captures_per_episode += raw.outcome_captures[finished].tolist()
++            for k, v in getattr(raw, "outcome_stats", {}).items():
++                stat_sums[k] = stat_sums.get(k, 0.0) + float(v[finished].sum().item())
++            closest_done += closest[finished].tolist()
++            closest[finished] = float("inf")
+             for row in finished.tolist():
+                 intercept_times += episode_intercept_times[row]
+                 episode_intercept_times[row] = []
+             step_in_episode[finished] = 0.0
+ 
+-    label = args_cli.checkpoint or f"baseline:{args_cli.baseline or zero}"
++    label = args_cli.checkpoint or f"baseline:{args_cli.baseline or 'zero'}"
+     print("\n=== %s on %s ===" % (label, args_cli.task), flush=True)
+     print("episodes:            %d" % episodes, flush=True)
+     print("interception rate:   %.1f%% of attackers" % (100.0 * intercepted / max(attacker_slots, 1)), flush=True)
+@@ -153,6 +333,26 @@ def main():
+     else:
+         print("time to intercept:   n/a (nothing intercepted)", flush=True)
+ 
++    print("downed per episode:  %.2f (episode = %.0f s, waves respawn)" % (
++        sum(captures_per_episode) / max(len(captures_per_episode), 1), raw.cfg.episode_length_s), flush=True)
++    fin = [c for c in closest_done if c != float("inf")]
++    if fin:
++        print("closest to site:     %.2f m mean of episode minima (site radius %.1f m)" % (
++            sum(fin) / len(fin), raw.cfg.site_radius), flush=True)
++    if stat_sums:
++        print("per-episode means (reward terms are per defender, summed over the episode):", flush=True)
++        for k in sorted(stat_sums):
++            print("   %-34s %9.3f" % (k, stat_sums[k] / max(episodes, 1)), flush=True)
++    import json, os
++    os.makedirs("outputs", exist_ok=True)
++    rec = dict(label=label, task=args_cli.task, overrides=args_cli.set, episodes=episodes,
++               interception_rate=intercepted / max(attacker_slots, 1), breach_rate=breaches / max(episodes, 1),
++               time_to_intercept=(sum(intercept_times) / len(intercept_times)) if intercept_times else None,
++               downed_per_episode=sum(captures_per_episode) / max(len(captures_per_episode), 1),
++               closest_to_site=(sum(fin) / len(fin)) if fin else None,
++               stats={k: v / max(episodes, 1) for k, v in stat_sums.items()})
++    with open("outputs/evaluate_results.jsonl", "a") as f:
++        f.write(json.dumps(rec) + "\n")
+     env.close()
+ 
+ 
+diff --git a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/__init__.py b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/__init__.py
+index ec0a705..86f72c3 100644
+--- a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/__init__.py
++++ b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/__init__.py
+@@ -15,3 +15,27 @@ gym.register(
+         "skrl_mappo_cfg_entry_point": f"{agents.__name__}:skrl_mappo_cfg.yaml",
+     },
+ )
++
++gym.register(
++    id="AS-Defend-Assign-v0",
++    entry_point=f"{__name__}.tello_defend_env:TelloDefendEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": f"{__name__}.tello_defend_env_cfg:TelloDefendAssignEnvCfg",
++        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
++        "skrl_ippo_cfg_entry_point": f"{agents.__name__}:skrl_ippo_cfg.yaml",
++        "skrl_mappo_cfg_entry_point": f"{agents.__name__}:skrl_mappo_cfg.yaml",
++    },
++)
++
++gym.register(
++    id="AS-Defend-Live-v0",
++    entry_point=f"{__name__}.tello_defend_env:TelloDefendEnv",
++    disable_env_checker=True,
++    kwargs={
++        "env_cfg_entry_point": f"{__name__}.tello_defend_env_cfg:TelloDefendLiveEnvCfg",
++        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
++        "skrl_ippo_cfg_entry_point": f"{agents.__name__}:skrl_ippo_cfg.yaml",
++        "skrl_mappo_cfg_entry_point": f"{agents.__name__}:skrl_mappo_cfg.yaml",
++    },
++)
+diff --git a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ippo_cfg.yaml b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ippo_cfg.yaml
+index f033dfe..5ac4b76 100644
+--- a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ippo_cfg.yaml
++++ b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ippo_cfg.yaml
+@@ -7,7 +7,7 @@ models:
+   separate: False
+   policy:  # see gaussian_model parameters
+     class: GaussianMixin
+-    clip_actions: True  # env clamps to [-1, 1]; without this the policy std runs away
++    clip_actions: False  # True made PPO learn nothing / NaN (Hover A/B, run 2404611); the env clamps to [-1, 1]
+     clip_log_std: True
+     min_log_std: -20.0
+     max_log_std: 2.0
+diff --git a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_mappo_cfg.yaml b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_mappo_cfg.yaml
+index ae792b7..3f1c1a7 100644
+--- a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_mappo_cfg.yaml
++++ b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_mappo_cfg.yaml
+@@ -7,7 +7,7 @@ models:
+   separate: True
+   policy:  # see gaussian_model parameters
+     class: GaussianMixin
+-    clip_actions: True  # env clamps to [-1, 1]; without this the policy std runs away
++    clip_actions: False  # True made PPO learn nothing / NaN (Hover A/B, run 2404611); the env clamps to [-1, 1]
+     clip_log_std: True
+     min_log_std: -20.0
+     max_log_std: 2.0
+diff --git a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ppo_cfg.yaml b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ppo_cfg.yaml
+index d646223..b40a2e2 100644
+--- a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ppo_cfg.yaml
++++ b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/agents/skrl_ppo_cfg.yaml
+@@ -7,7 +7,7 @@ models:
+   separate: False
+   policy:
+     class: GaussianMixin
+-    clip_actions: True  # env clamps to [-1, 1]; without this the policy std runs away
++    clip_actions: False  # True made PPO learn nothing / NaN (Hover A/B, run 2404611); the env clamps to [-1, 1]
+     clip_log_std: True
+     min_log_std: -20.0
+     max_log_std: 2.0
+diff --git a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/tello_defend_env.py b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/tello_defend_env.py
+index 136c527..5a3f5e5 100644
+--- a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/tello_defend_env.py
++++ b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/tello_defend_env.py
+@@ -3,12 +3,23 @@
+ Each defender is an agent with the same four-channel velocity action as the single-drone
+ tasks, so trained policies remain flyable on real hardware. Attackers are scripted by
+ default and dive towards the protected site.
++
++Actions are **world-frame** ``[vx, vy, vz, yaw_rate]`` in [-1, 1]. With the cascade (Tello
++firmware) model the env rotates them into the heading frame the real ``rc`` command uses; the
++live runner does the same rotation with the measured yaw.
++
++Everything added for the day-of setup (3vN slots, ram take-downs, difficulty slider, Tello
++firmware model, position-feed lag/noise, crash bounds, dense/sparse rewards, curriculum,
++per-term logging) is behind cfg flags whose defaults reproduce ``AS-Defend-v0``.
+ """
+ 
+ from __future__ import annotations
+ 
++import dataclasses
++import math
+ from collections.abc import Sequence
+ 
++import gymnasium as gym
+ import torch
+ 
+ import isaaclab.sim as sim_utils
+@@ -16,46 +27,119 @@ from isaaclab.assets import RigidObject
+ from isaaclab.envs import DirectMARLEnv
+ from isaaclab.markers import CUBOID_MARKER_CFG, VisualizationMarkers
+ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+-from isaaclab.utils.math import sample_uniform
++from isaaclab.utils.math import quat_apply_inverse, quat_from_euler_xyz, sample_uniform
+ 
+ from action_space_kit.assets import TELLO_CFG, TELLO_MASS
+-from action_space_kit.control import TelloVelocityController
++from action_space_kit.control import TelloCascadeController, TelloVelocityController
+ from action_space_kit.rl.terminal_observation import TerminalObservationMixin
+ 
+-from .tello_defend_env_cfg import TelloDefendEnvCfg
++from .assignment import assign_targets, intercept_time, slot_order
++from .attackers import AttackerBrain
++from .fast_dynamics import RandomizedVelocityController
++from .feed import AttackerFeed
++from .tello_defend_env_cfg import TelloDefendEnvCfg, apply_curriculum, obs_dim
++
++
++def _yaw(quat_w: torch.Tensor) -> torch.Tensor:
++    w, x, y, z = quat_w.unbind(-1)
++    return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+ 
+ 
+ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
+     cfg: TelloDefendEnvCfg
+ 
+     def __init__(self, cfg: TelloDefendEnvCfg, render_mode: str | None = None, **kwargs):
++        # presets and spaces are derived here so hydra / --set overrides of team sizes take effect
++        if cfg.curriculum_stage is not None and cfg.curriculum_stage >= 0:
++            apply_curriculum(cfg, int(cfg.curriculum_stage))
++        cfg.possible_agents = [f"defender_{i}" for i in range(cfg.num_defenders)]
++        cfg.action_spaces = {a: gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for a in cfg.possible_agents}
++        cfg.observation_spaces = {a: obs_dim(cfg) for a in cfg.possible_agents}
+         super().__init__(cfg, render_mode, **kwargs)
+ 
+-        inertia_zz = float(self._defenders[0].root_physx_view.get_inertias()[0].reshape(3, 3)[2, 2])
+-        make_controller = lambda: TelloVelocityController(  # noqa: E731
+-            cfg=self.cfg.command,
+-            num_envs=self.num_envs,
+-            mass=TELLO_MASS,
+-            inertia_zz=inertia_zz,
+-            device=self.device,
++        E, D, A = self.num_envs, self.cfg.num_defenders, self.cfg.num_attackers
++        view = self._defenders[0].root_physx_view
++        inertia = view.get_inertias()[0].reshape(3, 3).to(self.device)
++        inertia_zz = float(inertia[2, 2])
++        self._cascade = None
++        if self.cfg.dynamics_model == "cascade":
++            self._cascade = TelloCascadeController(
++                cfg=self.cfg.dynamics,
++                num_drones=E * D,
++                nominal_mass=float(view.get_masses()[0].sum()),
++                inertia=inertia,
++                physics_dt=self.physics_dt,
++                device=self.device,
++            )
++        elif self.cfg.dynamics_model != "velocity":
++            raise ValueError(f"unknown dynamics_model {self.cfg.dynamics_model!r}")
++        make_controller = lambda cmd_cfg: TelloVelocityController(  # noqa: E731
++            cfg=cmd_cfg, num_envs=E, mass=TELLO_MASS, inertia_zz=inertia_zz, device=self.device
+         )
+-        self._defender_ctl = [make_controller() for _ in range(self.cfg.num_defenders)]
+-        self._attacker_ctl = [make_controller() for _ in range(self.cfg.num_attackers)]
++        # fast-model randomization (ws-fast-env): only when a fast_* list is set, else the plain controller
++        self._fast_dr = self._cascade is None and any(
++            len(getattr(self.cfg, k, []) or []) > 0
++            for k in ("fast_response_time", "fast_response_time_z", "fast_max_accel", "fast_max_accel_z", "fast_latency_steps"))
++        if self._fast_dr:
++            self._defender_ctl = [RandomizedVelocityController(
++                self.cfg.command, E, TELLO_MASS, inertia_zz, self.device, self.cfg.fast_response_time,
++                self.cfg.fast_max_accel, self.cfg.fast_max_accel_z, self.cfg.fast_latency_steps,
++                self.cfg.fast_response_time_z) for _ in range(D)]
++        else:
++            self._defender_ctl = [make_controller(self.cfg.command) for _ in range(D)]
++        attacker_cmd = dataclasses.replace(self.cfg.command, max_lin_speed=self.cfg.attacker_max_speed)
++        self._attacker_ctl = [make_controller(attacker_cmd) for _ in range(A)]
+ 
+-        self._actions = {
+-            agent: torch.zeros(self.num_envs, 4, device=self.device) for agent in self.cfg.possible_agents
+-        }
++        self._actions = {agent: torch.zeros(E, 4, device=self.device) for agent in self.cfg.possible_agents}
+         # attacker bookkeeping
+-        self._attacker_alive = torch.ones(self.num_envs, self.cfg.num_attackers, device=self.device, dtype=torch.bool)
+-        self._attacker_speed = torch.zeros(self.num_envs, self.cfg.num_attackers, device=self.device)
+-        self._breached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+-        self._prev_distance = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)
++        self._attacker_alive = torch.ones(E, A, device=self.device, dtype=torch.bool)
++        self._attacker_active = torch.ones(E, A, device=self.device, dtype=torch.bool)
++        self._attacker_speed = torch.zeros(E, A, device=self.device)
++        self._brain = AttackerBrain(E, A, self.device)
++        self._attacker_cmd = torch.zeros(E, A, 4, device=self.device)  # brain mode, cached per policy step
++        self._breached = torch.zeros(E, device=self.device, dtype=torch.bool)
++        self._defender_alive = torch.ones(E, D, device=self.device, dtype=torch.bool)
++        self._defenders_can_die = any(
++            v is not None for v in (self.cfg.crash_z_min, self.cfg.crash_z_max, self.cfg.arena_radius, self.cfg.collide_radius)
++        ) or self.cfg.defender_loss_prob > 0.0
++        self._prev_distance = torch.zeros(E, D, device=self.device)
++        # per (defender, attacker) previous distance, so a reassignment never becomes a closing spike
++        self._prev_pair_distance = torch.zeros(E, D, A, device=self.device)
++        # steps left with closing forced to zero after a teleport (reset / respawned wave)
++        self._closing_blackout = torch.full((E,), 2, device=self.device, dtype=torch.long)
++        # assignment the policy last observed, (E, D); read by rewards, baselines and DAgger
++        self.assigned_targets = torch.arange(D, device=self.device).remainder(A).repeat(E, 1)
++        self.assignment_switches = torch.zeros(E, device=self.device)
++        self._observing_terminal = False  # TerminalObservationMixin: _get_observations must be read-only then
++
++        self._feed = None
++        if self.cfg.feed_model:
++            self._feed = AttackerFeed(E, A, self.step_dt, self.cfg.feed_delay_s, self.cfg.feed_noise,
++                                      self.cfg.feed_dropout, self.cfg.feed_alpha, self.cfg.feed_beta, self.device)
++
++        # per-step events, computed once in _get_dones (Isaac Lab calls it before _get_rewards)
++        self._captured = torch.zeros(E, A, device=self.device, dtype=torch.bool)
++        self._def_credit = torch.zeros(E, D, device=self.device)
++        self._cleared = torch.zeros(E, device=self.device, dtype=torch.bool)
++        self._crashed_now = torch.zeros(E, D, device=self.device, dtype=torch.bool)
++        self._lost_now = torch.zeros(E, D, device=self.device, dtype=torch.bool)
++        self._terminated = torch.zeros(E, device=self.device, dtype=torch.bool)
++        self._wiped = torch.zeros(E, device=self.device, dtype=torch.bool)
++        self._finished = torch.zeros(E, device=self.device, dtype=torch.bool)
++
+         # Episode outcome, latched in _get_dones before Isaac Lab resets the environment.
+         # Reading _breached after env.step() is too late: the reset has already cleared it.
+-        self._episode_captures = torch.zeros(self.num_envs, device=self.device)
+-        self.outcome_breached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+-        self.outcome_captures = torch.zeros(self.num_envs, device=self.device)
+-        self.outcome_valid = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
++        self._episode_captures = torch.zeros(E, device=self.device)
++        self.outcome_breached = torch.zeros(E, device=self.device, dtype=torch.bool)
++        self.outcome_captures = torch.zeros(E, device=self.device)
++        self.outcome_valid = torch.zeros(E, device=self.device, dtype=torch.bool)
++        # per-episode diagnostics (docs/TRAINING_PLAN.md §3.3), latched in outcome_stats on finish
++        self._ep_terms: dict[str, torch.Tensor] = {}
++        self._ep_stats = {k: torch.zeros(E, device=self.device) for k in
++                          ("steps", "speed", "saturation", "same_target", "lost", "crashes",
++                           "crash_low", "crash_high", "crash_arena", "crash_collide")}
++        self._ep_min_dist = torch.full((E, D), float("inf"), device=self.device)
++        self.outcome_stats: dict[str, torch.Tensor] = {}
+ 
+     # -- scene ------------------------------------------------------------------
+ 
+@@ -64,12 +148,10 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
+         self._attackers = []
+         for i in range(self.cfg.num_defenders):
+             cfg = TELLO_CFG.replace(prim_path=f"/World/envs/env_.*/Defender_{i}")
+-            obj = RigidObject(cfg)
+-            self._defenders.append(obj)
++            self._defenders.append(RigidObject(cfg))
+         for i in range(self.cfg.num_attackers):
+             cfg = TELLO_CFG.replace(prim_path=f"/World/envs/env_.*/Attacker_{i}")
+-            obj = RigidObject(cfg)
+-            self._attackers.append(obj)
++            self._attackers.append(RigidObject(cfg))
+ 
+         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+         # Sensors must exist before cloning: the clone creates their per-env prims, and
+@@ -96,36 +178,105 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
+         """Hook for subclasses to add sensors. Called before the scene is cloned."""
+         return
+ 
++    # -- helpers ----------------------------------------------------------------
++
++    def _site(self) -> torch.Tensor:
++        site = self.scene.env_origins.clone()
++        site[:, 2] += self.cfg.site_height * 0.5
++        return site
++
++    def _def_stack(self, field: str) -> torch.Tensor:
++        return torch.stack([getattr(d.data, field) for d in self._defenders], dim=1)
++
++    def _brain_mode(self) -> bool:
++        return self.cfg.attacker_difficulty is not None and self.cfg.attacker_difficulty >= 0
++
+     # -- stepping ---------------------------------------------------------------
+ 
+     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
+-        for agent, action in actions.items():
+-            self._actions[agent] = action.clone().clamp(-1.0, 1.0)
++        for i, agent in enumerate(self.cfg.possible_agents):
++            a = actions[agent].clone().clamp(-1.0, 1.0)
++            # a downed defender takes no commands
++            self._actions[agent] = a * self._defender_alive[:, i].unsqueeze(-1).float()
++        if self._cascade is not None:
++            cmd = torch.stack([self._actions[a] for a in self.cfg.possible_agents], dim=1)  # (E, D, 4) world
++            yaw = _yaw(self._def_stack("root_quat_w"))
++            c, s = torch.cos(yaw), torch.sin(yaw)
++            vx, vy = cmd[..., 0], cmd[..., 1]
++            cmd = torch.stack([c * vx + s * vy, -s * vx + c * vy, cmd[..., 2], cmd[..., 3]], dim=-1)  # heading frame
++            self._cascade.set_command(cmd.reshape(-1, 4))
++        elif self._fast_dr:
++            for i, agent in enumerate(self.cfg.possible_agents):
++                self._defender_ctl[i].set_command(self._actions[agent])
++        if self._brain_mode():
++            self._brain.advance(self.step_dt)
++            att_pos, _ = self._attacker_states()
++            v = self._brain.velocity(att_pos, self._site(), self._def_stack("root_pos_w"), self._defender_alive,
++                                     self.cfg.evade_radius, self.cfg.attacker_max_speed)
++            cmd = torch.cat([v / self.cfg.attacker_max_speed, torch.zeros_like(v[..., :1])], dim=-1)
++            self._attacker_cmd = cmd * self._attacker_alive.unsqueeze(-1).float()
+ 
+     def _apply_action(self) -> None:
+-        for i, drone in enumerate(self._defenders):
+-            force, torque = self._defender_ctl[i].compute(
+-                actions=self._actions[f"defender_{i}"],
+-                lin_vel_w=drone.data.root_lin_vel_w,
+-                ang_vel_b=drone.data.root_ang_vel_b,
+-                projected_gravity_b=drone.data.projected_gravity_b,
+-                dt=self.physics_dt,
++        E, D = self.num_envs, self.cfg.num_defenders
++        alive = self._defender_alive.unsqueeze(-1).float()
++        if self._cascade is not None:
++            force_b, torque_b = self._cascade.compute(
++                lin_vel_w=self._def_stack("root_lin_vel_w").reshape(-1, 3),
++                quat_w=self._def_stack("root_quat_w").reshape(-1, 4),
++                ang_vel_b=self._def_stack("root_ang_vel_b").reshape(-1, 3),
++                lin_vel_b=self._def_stack("root_lin_vel_b").reshape(-1, 3),
+             )
+-            drone.set_external_force_and_torque(forces=force, torques=torque, body_ids=[0])
+-
+-        attacker_actions = self._scripted_attacker_actions()
++            force_b = force_b.view(E, D, 3) * alive
++            torque_b = torque_b.view(E, D, 3) * alive
++            for i, drone in enumerate(self._defenders):
++                drone.set_external_force_and_torque(
++                    forces=force_b[:, i].unsqueeze(1), torques=torque_b[:, i].unsqueeze(1), body_ids=[0]
++                )
++        else:
++            for i, drone in enumerate(self._defenders):
++                if self._fast_dr:  # command latched (with latency) in _pre_physics_step
++                    force_w, torque = self._defender_ctl[i].compute(
++                        lin_vel_w=drone.data.root_lin_vel_w,
++                        ang_vel_b=drone.data.root_ang_vel_b,
++                        projected_gravity_b=drone.data.projected_gravity_b,
++                        dt=self.physics_dt,
++                    )
++                else:
++                    force_w, torque = self._defender_ctl[i].compute(
++                        actions=self._actions[f"defender_{i}"],
++                        lin_vel_w=drone.data.root_lin_vel_w,
++                        ang_vel_b=drone.data.root_ang_vel_b,
++                        projected_gravity_b=drone.data.projected_gravity_b,
++                        dt=self.physics_dt,
++                    )
++                # The controller works in the world frame, but set_external_force_and_torque applies
++                # forces in the body frame (is_global=False). Unrotated, any yaw turns the thrust with
++                # the body and the velocity loop runs away once yaw passes ~90 degrees.
++                force_b = quat_apply_inverse(drone.data.root_quat_w, force_w.squeeze(1)).unsqueeze(1)
++                a = alive[:, i].unsqueeze(1)
++                drone.set_external_force_and_torque(forces=force_b * a, torques=torque * a, body_ids=[0])
++
++        attacker_actions = (
++            [self._attacker_cmd[:, i] for i in range(self.cfg.num_attackers)]
++            if self._brain_mode() else self._scripted_attacker_actions()
++        )
+         for i, drone in enumerate(self._attackers):
+-            force, torque = self._attacker_ctl[i].compute(
++            force_w, torque = self._attacker_ctl[i].compute(
+                 actions=attacker_actions[i],
+                 lin_vel_w=drone.data.root_lin_vel_w,
+                 ang_vel_b=drone.data.root_ang_vel_b,
+                 projected_gravity_b=drone.data.projected_gravity_b,
+                 dt=self.physics_dt,
+             )
+-            drone.set_external_force_and_torque(forces=force, torques=torque, body_ids=[0])
++            force_b = quat_apply_inverse(drone.data.root_quat_w, force_w.squeeze(1)).unsqueeze(1)
++            if self.cfg.capture_mode == "ram":
++                # a rammed attacker loses its motors and falls; parked (inactive) ones keep hovering
++                fallen = (self._attacker_active[:, i] & ~self._attacker_alive[:, i]).float().view(-1, 1, 1)
++                force_b, torque = force_b * (1.0 - fallen), torque * (1.0 - fallen)
++            drone.set_external_force_and_torque(forces=force_b, torques=torque, body_ids=[0])
+ 
+     def _scripted_attacker_actions(self) -> list[torch.Tensor]:
+-        """Fly each attacker at the protected site, with optional lateral weaving."""
++        """Legacy attackers: fly at the protected site, with optional lateral weaving."""
+         actions = []
+         for i, drone in enumerate(self._attackers):
+             to_site = self.scene.env_origins - drone.data.root_pos_w
+@@ -136,9 +287,9 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
+                 lateral = torch.stack([-direction[:, 1], direction[:, 0], torch.zeros_like(direction[:, 0])], dim=-1)
+                 direction = direction + self.cfg.attacker_evasion * torch.sin(phase).unsqueeze(-1) * lateral
+                 direction = direction / torch.clamp(torch.linalg.norm(direction, dim=-1, keepdim=True), min=1e-6)
+-            speed = (self._attacker_speed[:, i] / self.cfg.command.max_lin_speed).unsqueeze(-1)
++            speed = (self._attacker_speed[:, i] / self.cfg.attacker_max_speed).unsqueeze(-1)
+             action = torch.cat([direction * speed, torch.zeros(self.num_envs, 1, device=self.device)], dim=-1)
+-            # a downed attacker stops moving
++            # a downed (or parked) attacker stops moving
+             action = action * self._attacker_alive[:, i].unsqueeze(-1).float()
+             actions.append(action.clamp(-1.0, 1.0))
+         return actions
+@@ -146,114 +297,346 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
+     # -- MDP --------------------------------------------------------------------
+ 
+     def _attacker_states(self) -> tuple[torch.Tensor, torch.Tensor]:
+-        """Return attacker positions and velocities, shaped (num_envs, num_attackers, 3)."""
++        """Return true attacker positions and velocities, shaped (num_envs, num_attackers, 3)."""
+         pos = torch.stack([d.data.root_pos_w for d in self._attackers], dim=1)
+         vel = torch.stack([d.data.root_lin_vel_w for d in self._attackers], dim=1)
+         return pos, vel
+ 
+-    def _get_observations(self) -> dict[str, torch.Tensor]:
+-        attacker_pos, attacker_vel = self._attacker_states()
+-        site = self.scene.env_origins.clone()
+-        site[:, 2] += self.cfg.site_height * 0.5
++    def _uses_assignment(self) -> bool:
++        return self.cfg.assignment != "nearest" or self.cfg.obs_assigned_first or self.cfg.reward_mode == "dense"
++
++    def _time_to_go(self, attacker_pos, attacker_vel, def_pos=None) -> torch.Tensor:
++        """Lead-intercept time per defender/attacker pair at full defender speed, (E, D, A)."""
++        if def_pos is None:
++            def_pos = self._def_stack("root_pos_w")
++        rel = attacker_pos.unsqueeze(1) - def_pos.unsqueeze(2)
++        ttg, _ = intercept_time(rel, attacker_vel.unsqueeze(1).expand_as(rel), self.cfg.command.max_lin_speed)
++        return ttg
++
++    def _update_assignment(self, attacker_pos, attacker_vel, def_pos=None):
++        """Recompute self.assigned_targets (with hysteresis); returns the (E, D, A) time-to-go.
++
++        During the terminal-observation capture nothing is stored: the returned assignment is
++        only used to order that snapshot.
++        """
++        ttg = self._time_to_go(attacker_pos, attacker_vel, def_pos)
++        previous = self.assigned_targets
++        fresh = self._closing_blackout > 0  # a fresh episode / wave has no meaningful previous assignment
++        def_alive = self._defender_alive if self._defenders_can_die else None
++        target = assign_targets(ttg, self._attacker_alive, self.cfg.assignment, previous,
++                                self.cfg.assignment_hysteresis, def_alive=def_alive)
++        if fresh.any():
++            target[fresh] = assign_targets(ttg[fresh], self._attacker_alive[fresh], self.cfg.assignment,
++                                           def_alive=None if def_alive is None else def_alive[fresh])
++        if self._observing_terminal:
++            return ttg, target
++        self.assignment_switches += ((target != previous).any(-1) & ~fresh).float()
++        self.assigned_targets = target
++        return ttg, target
++
++    def _observed_attackers(self) -> tuple[torch.Tensor, torch.Tensor]:
++        """Attacker states as the defenders see them: true, or through the lagged feed + filter."""
++        true_pos, true_vel = self._attacker_states()
++        if self._feed is None:
++            return true_pos, true_vel
++        if self._observing_terminal:
++            return self._feed.est_pos, self._feed.est_vel
++        return self._feed.step(true_pos)
+ 
++    def _get_observations(self) -> dict[str, torch.Tensor]:
++        cfg = self.cfg
++        attacker_pos, attacker_vel = self._observed_attackers()
++        site = self._site()
++        def_pos = self._def_stack("root_pos_w")
++        def_vel = self._def_stack("root_lin_vel_w")
++        if cfg.own_pos_noise > 0.0:
++            def_pos = def_pos + torch.randn_like(def_pos) * cfg.own_pos_noise
++        if cfg.own_vel_noise > 0.0:
++            def_vel = def_vel + torch.randn_like(def_vel) * cfg.own_vel_noise
++
++        order = None
++        if self._uses_assignment():
++            ttg, target = self._update_assignment(attacker_pos, attacker_vel, def_pos)
++            if cfg.obs_assigned_first:
++                order = slot_order(ttg, self._attacker_alive, target)  # (E, D, A)
++
++        valid_all = self._attacker_alive.float().unsqueeze(-1)  # (E, A, 1); parked/downed = 0
++        yaw = _yaw(self._def_stack("root_quat_w")) if cfg.obs_heading else None
+         obs = {}
+         for i, drone in enumerate(self._defenders):
+-            own_rel_site = drone.data.root_pos_w - site
+-            rel_pos = attacker_pos - drone.data.root_pos_w.unsqueeze(1)
+-            rel_vel = attacker_vel - drone.data.root_lin_vel_w.unsqueeze(1)
++            own = def_pos[:, i]
++            rel_pos = attacker_pos - own.unsqueeze(1)
++            rel_vel = attacker_vel - def_vel[:, i].unsqueeze(1)
+             # A downed attacker is zeroed out and flagged, not pushed to a huge sentinel
+             # value: a 100 m spike dominates the running normalisation and destabilises
+             # the policy. The flag tells the network the slot is empty.
+-            alive = self._attacker_alive.float().unsqueeze(-1)
+-            rel_pos = rel_pos.clamp(-self.cfg.obs_clip_pos, self.cfg.obs_clip_pos) * alive
+-            rel_vel = rel_vel.clamp(-self.cfg.obs_clip_vel, self.cfg.obs_clip_vel) * alive
+-            obs[f"defender_{i}"] = torch.cat(
+-                [
+-                    own_rel_site,
+-                    drone.data.root_lin_vel_w,
+-                    drone.data.projected_gravity_b,
+-                    rel_pos.reshape(self.num_envs, -1),
+-                    rel_vel.reshape(self.num_envs, -1),
+-                    alive.squeeze(-1),
+-                ],
+-                dim=-1,
+-            )
++            valid = valid_all
++            if order is not None:
++                idx = order[:, i]  # (E, A): slot -> attacker
++                rel_pos = rel_pos.gather(1, idx.unsqueeze(-1).expand(-1, -1, 3))
++                rel_vel = rel_vel.gather(1, idx.unsqueeze(-1).expand(-1, -1, 3))
++                valid = valid.gather(1, idx.unsqueeze(-1))
++            rel_pos = rel_pos.clamp(-cfg.obs_clip_pos, cfg.obs_clip_pos) * valid
++            rel_vel = rel_vel.clamp(-cfg.obs_clip_vel, cfg.obs_clip_vel) * valid
++            parts = [own - site, def_vel[:, i], drone.data.projected_gravity_b]
++            if cfg.obs_heading:
++                parts.append(torch.stack([torch.sin(yaw[:, i]), torch.cos(yaw[:, i])], dim=-1))
++            if cfg.obs_teammates:
++                for j in range(cfg.num_defenders):
++                    if j == i:
++                        continue
++                    m = self._defender_alive[:, j].float().unsqueeze(-1)
++                    parts += [
++                        (def_pos[:, j] - own).clamp(-cfg.obs_clip_pos, cfg.obs_clip_pos) * m,
++                        (def_vel[:, j] - def_vel[:, i]).clamp(-cfg.obs_clip_vel, cfg.obs_clip_vel) * m,
++                        m,
++                    ]
++            parts += [rel_pos.reshape(self.num_envs, -1), rel_vel.reshape(self.num_envs, -1), valid.squeeze(-1)]
++            obs[f"defender_{i}"] = torch.cat(parts, dim=-1)
+         return obs
+ 
+-    def _get_rewards(self) -> dict[str, torch.Tensor]:
+-        attacker_pos, _ = self._attacker_states()
+-        site = self.scene.env_origins.clone()
+-        site[:, 2] += self.cfg.site_height * 0.5
+-
+-        # interceptions: any live attacker within capture radius of any defender
+-        captured = torch.zeros_like(self._attacker_alive)
+-        defender_credit = torch.zeros(self.num_envs, self.cfg.num_defenders, device=self.device)
+-        for i, drone in enumerate(self._defenders):
+-            dist = torch.linalg.norm(attacker_pos - drone.data.root_pos_w.unsqueeze(1), dim=-1)
+-            hit = (dist < self.cfg.capture_radius) & self._attacker_alive
+-            captured |= hit
+-            defender_credit[:, i] = hit.float().sum(dim=-1)
++    # -- events (once per policy step, from _get_dones) ---------------------------
++
++    def _step_events(self) -> None:
++        cfg = self.cfg
++        E, D = self.num_envs, cfg.num_defenders
++        att_pos, att_vel = self._attacker_states()
++        def_pos = self._def_stack("root_pos_w")
++        def_vel = self._def_stack("root_lin_vel_w")
++        site = self._site()
++        def_alive = self._defender_alive
++
++        rel = att_pos.unsqueeze(1) - def_pos.unsqueeze(2)  # (E, D, A, 3) defender -> attacker
++        dist = torch.linalg.norm(rel, dim=-1)
++        live = self._attacker_alive.unsqueeze(1)
++        # diagnostics: closest approach of each defender to any live attacker this episode
++        near = torch.where(live, dist, torch.full_like(dist, float("inf"))).min(-1).values
++        self._ep_min_dist = torch.where(def_alive, torch.minimum(self._ep_min_dist, near), self._ep_min_dist)
++
++        hit = (dist < cfg.capture_radius) & live & def_alive.unsqueeze(-1)
++        if cfg.capture_mode == "ram":
++            closing_speed = ((def_vel.unsqueeze(2) - att_vel.unsqueeze(1)) * rel).sum(-1) / dist.clamp(min=1e-6)
++            hit &= closing_speed > cfg.ram_min_speed
++        captured = hit.any(1)
++        self._captured = captured
++        self._def_credit = hit.float().sum(-1)
+         self._attacker_alive &= ~captured
++        self._episode_captures += captured.float().sum(-1)
++
++        z = def_pos[..., 2] - self.scene.env_origins[:, 2].unsqueeze(-1)
++        no = torch.zeros_like(def_alive)
++        c_low = (z < cfg.crash_z_min) if cfg.crash_z_min is not None else no
++        c_high = (z > cfg.crash_z_max) if cfg.crash_z_max is not None else no
++        c_arena = (torch.linalg.norm(def_pos[..., :2] - site[:, :2].unsqueeze(1), dim=-1) > cfg.arena_radius
++                   if cfg.arena_radius is not None else no)
++        c_coll = no
++        if cfg.collide_radius is not None and D > 1:
++            dd = torch.linalg.norm(def_pos.unsqueeze(1) - def_pos.unsqueeze(2), dim=-1)
++            both = def_alive.unsqueeze(1) & def_alive.unsqueeze(2) & ~torch.eye(D, dtype=torch.bool, device=self.device)
++            c_coll = ((dd < cfg.collide_radius) & both).any(-1)
++        crashed = (c_low | c_high | c_arena | c_coll) & def_alive
++        for k, c in (("crash_low", c_low), ("crash_high", c_high), ("crash_arena", c_arena), ("crash_collide", c_coll)):
++            self._ep_stats[k] += (c & def_alive).float().sum(-1)
++        lost = crashed.clone()
++        if cfg.defender_loss_prob > 0.0:
++            lost |= hit.any(-1) & (torch.rand(E, D, device=self.device) < cfg.defender_loss_prob)
++        self._crashed_now = crashed
++        self._lost_now = lost & def_alive
++        self._defender_alive = def_alive & ~self._lost_now
++
++        radial = torch.linalg.norm(att_pos[:, :, :2] - site[:, :2].unsqueeze(1), dim=-1)
++        self._breached = ((radial < cfg.site_radius) & self._attacker_alive).any(-1)
++        # Losing every defender is a failure too, and pays the breach penalty on top of the crash
++        # penalties. Otherwise suicide (dive into the ground: -10 crash, episode over) beats letting
++        # the attacker through (-20 breach): measured dive -9.4 vs zero -11.8 at stage 3.
++        self._wiped = ~self._defender_alive.any(-1) & def_alive.any(-1)
++        self._breached = self._breached | self._wiped
++        self._cleared = captured.any(-1) & ~self._attacker_alive.any(-1)
++
++        # behaviour stats
++        st = self._ep_stats
++        st["steps"] += 1.0
++        n_alive = def_alive.float().sum(-1).clamp(min=1.0)
++        st["speed"] += (torch.linalg.norm(def_vel, dim=-1) * def_alive).sum(-1) / n_alive
++        acts = torch.stack([self._actions[a] for a in cfg.possible_agents], dim=1)
++        st["saturation"] += ((acts.abs() > 0.95).float().mean(-1) * def_alive).sum(-1) / n_alive
++        if D > 1 and self._uses_assignment():
++            # a live attacker left uncovered while defenders double up on another one
++            t = self.assigned_targets
++            A = cfg.num_attackers
++            onehot = torch.nn.functional.one_hot(t, A) * def_alive.unsqueeze(-1)  # (E, D, A)
++            covered = (onehot.sum(1).clamp(max=1) * self._attacker_alive).sum(-1)
++            need = torch.minimum(self._attacker_alive.sum(-1), def_alive.sum(-1))
++            st["same_target"] += (covered < need).float()
++        st["lost"] += self._lost_now.float().sum(-1)
++        st["crashes"] += crashed.float().sum(-1)
++
++    # -- rewards ----------------------------------------------------------------
++
++    def _capture_reward(self, own: torch.Tensor, captured: torch.Tensor) -> torch.Tensor:
++        beta = self.cfg.rew_capture_team_share
++        team = captured.float().sum(dim=-1) / self.cfg.num_defenders
++        return self.cfg.rew_scale_capture * ((1.0 - beta) * own + beta * team)
++
++    def _events_terms(self) -> dict[str, torch.Tensor]:
++        D = self.cfg.num_defenders
++        cap = torch.stack([self._capture_reward(self._def_credit[:, i], self._captured) for i in range(D)], dim=1)
++        ones = torch.ones(self.num_envs, D, device=self.device)
++        return {
++            "capture": cap,
++            "breach": self.cfg.rew_scale_breach * self._breached.float().unsqueeze(-1) * ones,
++            "cleared": self.cfg.rew_scale_cleared * self._cleared.float().unsqueeze(-1) * ones,
++        }
+ 
+-        # breach: a live attacker inside the protected cylinder
+-        radial = torch.linalg.norm(attacker_pos[:, :, :2] - site[:, :2].unsqueeze(1), dim=-1)
+-        inside = (radial < self.cfg.site_radius) & self._attacker_alive
+-        self._breached = inside.any(dim=-1)
+-
+-        # every attacker down this step: the outcome the task actually wants
+-        cleared = captured.any(dim=-1) & ~self._attacker_alive.any(dim=-1)
+-        self._episode_captures += captured.float().sum(dim=-1)
++    def _legacy_terms(self) -> dict[str, torch.Tensor]:
++        cfg, dt = self.cfg, self.step_dt
++        attacker_pos, _ = self._attacker_states()
++        def_pos = self._def_stack("root_pos_w")
++        effort = torch.stack([torch.sum(torch.square(self._actions[a]), dim=-1) for a in cfg.possible_agents], 1)
++        if self._uses_assignment():
++            # closing/proximity towards each defender's *assigned* attacker (the one it observed in slot 0)
++            pair = torch.linalg.norm(attacker_pos.unsqueeze(1) - def_pos.unsqueeze(2), dim=-1)  # (E, D, A)
++            target = self.assigned_targets.unsqueeze(-1)
++            now = pair.gather(2, target).squeeze(-1)
++            before = self._prev_pair_distance.gather(2, target).squeeze(-1)
++            valid = (self._closing_blackout == 0).unsqueeze(-1)
++            closing = torch.where(valid, before - now, torch.zeros_like(now)).clamp(-1.0, 1.0)
++            self._prev_pair_distance = pair
++        else:
++            dist = torch.linalg.norm(attacker_pos.unsqueeze(1) - def_pos.unsqueeze(2), dim=-1)
++            any_alive = self._attacker_alive.any(dim=-1, keepdim=True)
++            dist = torch.where(self._attacker_alive.unsqueeze(1), dist, torch.full_like(dist, float("inf")))
++            now = dist.min(dim=-1).values
++            # with no live attacker left there is no distance to close: carry the previous value
++            now = torch.where(any_alive, now, self._prev_distance)
++            closing = (self._prev_distance - now).clamp(-1.0, 1.0)
++            self._prev_distance = now
++        proximity = torch.exp(-now.clamp(min=0.0, max=cfg.spawn_radius * 2.0) / cfg.spawn_radius)
++        terms = {
++            "closing": cfg.rew_scale_closing * closing,
++            "proximity": cfg.rew_scale_proximity * proximity * dt,
++            "effort": cfg.rew_scale_effort * effort * dt,
++            "alive": torch.full_like(closing, cfg.rew_scale_alive * dt),
++        }
++        terms.update(self._events_terms())
++        return terms
++
++    def _dense_terms(self) -> dict[str, torch.Tensor]:
++        """Closing on the assigned target (no proximity/alive income) + events + crash/separation penalties.
++
++        closing = before - gamma * now on the target assigned at the previous observation, so a reassignment
++        never pays (both distances are to the same attacker). With shaping_gamma = 1 it telescopes per target
++        to (start - end distance): it can't be farmed, and with no per-step income or cost, ending the episode
++        early is never attractive.
++        """
++        cfg, dt = self.cfg, self.step_dt
++        attacker_pos, _ = self._attacker_states()
++        def_pos = self._def_stack("root_pos_w")
++        pair = torch.linalg.norm(attacker_pos.unsqueeze(1) - def_pos.unsqueeze(2), dim=-1)
++        target = self.assigned_targets.unsqueeze(-1)
++        now = pair.gather(2, target).squeeze(-1)
++        before = self._prev_pair_distance.gather(2, target).squeeze(-1)
++        self._prev_pair_distance = pair
++        alive_before = self._defender_alive | self._lost_now
++        valid = (self._closing_blackout == 0).unsqueeze(-1) & alive_before
++        closing = torch.where(valid, before - cfg.shaping_gamma * now, torch.zeros_like(now)).clamp(-0.5, 0.5)
++
++        effort = torch.stack([torch.sum(torch.square(self._actions[a]), dim=-1) for a in cfg.possible_agents], 1)
++        sep = torch.zeros_like(now)
++        if cfg.num_defenders > 1:
++            dd = torch.linalg.norm(def_pos.unsqueeze(1) - def_pos.unsqueeze(2), dim=-1)
++            both = self._defender_alive.unsqueeze(1) & self._defender_alive.unsqueeze(2)
++            both &= ~torch.eye(cfg.num_defenders, dtype=torch.bool, device=self.device)
++            sep = ((cfg.separation_radius - dd).clamp(min=0.0) * both).sum(-1)
++        terms = {
++            "closing": cfg.rew_scale_closing * cfg.shaping_scale * closing,
++            "effort": cfg.rew_scale_effort * effort * dt,
++            "separation": cfg.rew_scale_separation * sep * dt,
++            "crash": cfg.rew_scale_crash * self._lost_now.float(),
++        }
++        terms.update(self._events_terms())
++        return terms
++
++    def _sparse_terms(self) -> dict[str, torch.Tensor]:
++        D = self.cfg.num_defenders
++        ones = torch.ones(self.num_envs, D, device=self.device)
++        return {
++            "capture": self._captured.float().sum(-1, keepdim=True) * ones,  # team reward
++            "cleared": 0.5 * self._cleared.float().unsqueeze(-1) * ones,
++            "breach": -1.0 * self._breached.float().unsqueeze(-1) * ones,
++            "crash": -0.5 * self._lost_now.float(),
++        }
+ 
+-        rewards = {}
+-        for i, drone in enumerate(self._defenders):
+-            dist = torch.linalg.norm(attacker_pos - drone.data.root_pos_w.unsqueeze(1), dim=-1)
+-            any_alive = self._attacker_alive.any(dim=-1)
+-            dist = torch.where(self._attacker_alive, dist, torch.full_like(dist, float("inf")))
+-            nearest = dist.min(dim=-1).values
+-            # With no live attacker left there is no distance to close. Carrying the
+-            # previous value keeps `closing` at zero instead of swinging to the clamp,
+-            # which otherwise punishes the defender for the capture it just made.
+-            nearest = torch.where(any_alive, nearest, self._prev_distance[:, i])
+-            closing = self._prev_distance[:, i] - nearest
+-            self._prev_distance[:, i] = nearest
+-            effort = torch.sum(torch.square(self._actions[f"defender_{i}"]), dim=-1)
+-            proximity = torch.exp(-nearest.clamp(min=0.0, max=self.cfg.spawn_radius * 2.0) / self.cfg.spawn_radius)
+-            # Rates are scaled by step_dt; per-step deltas are not.
+-            #
+-            # proximity/alive/effort are rates (value per second), so without step_dt
+-            # their income over a 400-step episode dwarfs the capture bonus, and
+-            # clearing the field -- which ends the episode -- costs more future reward
+-            # than it pays, making stalling optimal.
+-            #
+-            # closing is already a per-step distance delta in metres. Scaling it by
+-            # step_dt as well shrinks the dense signal ~60x, leaving PPO with almost
+-            # nothing to follow between sparse captures. It telescopes over an episode
+-            # to (start distance - end distance), so at scale 5 a full 5 m approach is
+-            # worth ~25, comparable to one capture.
+-            shaping = (
+-                self.cfg.rew_scale_proximity * proximity
+-                + self.cfg.rew_scale_effort * effort
+-                + self.cfg.rew_scale_alive
+-            ) * self.step_dt + self.cfg.rew_scale_closing * closing.clamp(-1.0, 1.0)
+-            events = (
+-                self.cfg.rew_scale_capture * defender_credit[:, i]
+-                + self.cfg.rew_scale_breach * self._breached.float()
+-                + self.cfg.rew_scale_cleared * cleared.float()
+-            )
+-            rewards[f"defender_{i}"] = shaping + events
+-        return rewards
++    def _get_rewards(self) -> dict[str, torch.Tensor]:
++        mode = self.cfg.reward_mode
++        if mode == "legacy":
++            terms = self._legacy_terms()
++        elif mode == "dense":
++            terms = self._dense_terms()
++        elif mode == "sparse":
++            terms = self._sparse_terms()
++        else:
++            raise ValueError(f"unknown reward_mode {mode!r}")
++        self._closing_blackout = (self._closing_blackout - 1).clamp(min=0)
++
++        total = sum(terms.values())  # (E, D)
++        for k, v in terms.items():
++            if k not in self._ep_terms:
++                self._ep_terms[k] = torch.zeros(self.num_envs, device=self.device)
++            self._ep_terms[k] += v.mean(-1)
++        self._log_finished()
++        return {agent: total[:, i] for i, agent in enumerate(self.cfg.possible_agents)}
++
++    def _log_finished(self) -> None:
++        """Episode diagnostics for finished envs -> extras['log'] (TensorBoard via skrl) and outcome_stats."""
++        fin = self._finished
++        if not fin.any():
++            self.extras["log"] = {}
++            return
++        st = self._ep_stats
++        steps = st["steps"].clamp(min=1.0)
++        min_dist = self._ep_min_dist.clamp(max=20.0).mean(-1)
++        stats = {f"Episode_Reward/{k}": v for k, v in self._ep_terms.items()}
++        stats["Episode_Reward/total"] = sum(self._ep_terms.values())
++        stats.update({
++            "Episode/downed": self._episode_captures,
++            "Episode/breach": self._breached.float(),
++            "Episode/defenders_lost": st["lost"],
++            "Episode/crashes": st["crashes"],
++            "Episode/min_dist_to_attacker": min_dist,
++            "Episode/mean_speed": st["speed"] / steps,
++            "Episode/action_saturation": st["saturation"] / steps,
++            "Episode/uncovered_frac": st["same_target"] / steps,
++            "Episode/crash_low": st["crash_low"],
++            "Episode/crash_high": st["crash_high"],
++            "Episode/crash_arena": st["crash_arena"],
++            "Episode/crash_collide": st["crash_collide"],
++            "Episode/assignment_switches": self.assignment_switches.clone(),
++            "Episode/length_s": st["steps"] * self.step_dt,
++        })
++        self.outcome_stats = {k: torch.where(fin, v, self.outcome_stats.get(k, torch.zeros_like(v)))
++                              for k, v in stats.items()}
++        log = {k: v[fin].mean() for k, v in stats.items()}
++        log["Curriculum/stage"] = torch.tensor(float(-1 if self.cfg.curriculum_stage is None else self.cfg.curriculum_stage))
++        log["Curriculum/difficulty"] = torch.tensor(float(-1 if self.cfg.attacker_difficulty is None else self.cfg.attacker_difficulty))
++        self.extras["log"] = log
+ 
+     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
++        self._step_events()
+         time_out = self.episode_length_buf >= self.max_episode_length - 1
++        all_def_down = ~self._defender_alive.any(dim=-1)
+         all_down = ~self._attacker_alive.any(dim=-1)
+         if self.cfg.respawn_waves:
+-            # a cleared field starts the next wave; only a breach ends the episode
+-            if all_down.any():
+-                self._respawn_attackers(all_down.nonzero(as_tuple=False).flatten())
+-            done = self._breached
++            # a cleared field starts the next wave; only a breach (or losing every defender) ends the episode
++            wave = all_down & ~self._breached & ~all_def_down
++            if wave.any():
++                self._respawn_attackers(wave.nonzero(as_tuple=False).flatten())
++            done = self._breached | all_def_down
+         else:
+-            done = self._breached | all_down
++            done = self._breached | all_down | all_def_down
+         finished = done | time_out
++        self._terminated = done
++        self._finished = finished
+         self.outcome_valid = finished
+         self.outcome_breached = torch.where(finished, self._breached, self.outcome_breached)
+         self.outcome_captures = torch.where(finished, self._episode_captures, self.outcome_captures)
+@@ -261,69 +644,118 @@ class TelloDefendEnv(TerminalObservationMixin, DirectMARLEnv):
+         time_outs = {agent: time_out for agent in self.cfg.possible_agents}
+         return terminated, time_outs
+ 
+-    def _respawn_attackers(self, env_ids: torch.Tensor) -> None:
+-        """Send a fresh wave into the listed environments, leaving defenders as they are."""
+-        if len(env_ids) == 0:
+-            return
+-        num = len(env_ids)
++    # -- resets -----------------------------------------------------------------
++
++    def _spawn_ring(self, origins: torch.Tensor, count: int) -> torch.Tensor:
++        """(n, count, 3) world positions on the attacker spawn ring."""
++        n = origins.shape[0]
++        angle = sample_uniform(0.0, 2 * math.pi, (n, count), self.device)
++        pos = origins.unsqueeze(1).repeat(1, count, 1)
++        pos[..., 0] += self.cfg.spawn_radius * torch.cos(angle)
++        pos[..., 1] += self.cfg.spawn_radius * torch.sin(angle)
++        pos[..., 2] += sample_uniform(1.5, 3.0, (n, count), self.device)
++        return pos
++
++    def _place_attackers(self, env_ids: torch.Tensor, only_active: bool) -> None:
++        """Teleport attackers of ``env_ids``: active ones onto the spawn ring, inactive ones parked high up."""
++        A = self.cfg.num_attackers
+         origins = self.scene.env_origins[env_ids]
++        ring = self._spawn_ring(origins, A)
++        active = self._attacker_active[env_ids]
++        new_pos = torch.stack([d.data.root_pos_w[env_ids] for d in self._attackers], dim=1).clone()
+         for i, drone in enumerate(self._attackers):
+-            angle = sample_uniform(0.0, 6.2832, (num,), self.device)
+             state = drone.data.default_root_state[env_ids].clone()
+-            state[:, 0] = origins[:, 0] + self.cfg.spawn_radius * torch.cos(angle)
+-            state[:, 1] = origins[:, 1] + self.cfg.spawn_radius * torch.sin(angle)
+-            state[:, 2] = origins[:, 2] + sample_uniform(1.5, 3.0, (num,), self.device)
++            parked = origins.clone()
++            parked[:, 2] += 30.0 + 1.0 * i
++            pos = torch.where(active[:, i].unsqueeze(-1), ring[:, i], parked)
++            if only_active:
++                pos = torch.where(active[:, i].unsqueeze(-1), pos, new_pos[:, i])
++            state[:, :3] = pos
+             state[:, 7:] = 0.0
++            new_pos[:, i] = pos
+             drone.write_root_pose_to_sim(state[:, :7], env_ids)
+             drone.write_root_velocity_to_sim(state[:, 7:], env_ids)
+             self._attacker_ctl[i].reset(env_ids)
+-        self._attacker_alive[env_ids] = True
+-        self._attacker_speed[env_ids] = sample_uniform(
+-            self.cfg.attacker_speed[0], self.cfg.attacker_speed[1], (num, self.cfg.num_attackers), self.device
+-        )
++        self._attacker_alive[env_ids] = active
++        spd = sample_uniform(self.cfg.attacker_speed[0], self.cfg.attacker_speed[1], (len(env_ids), A), self.device)
++        self._attacker_speed[env_ids] = spd
++        mask = torch.zeros_like(self._attacker_alive)
++        mask[env_ids] = active
++        full_pos = torch.zeros(self.num_envs, A, 3, device=self.device)
++        full_pos[env_ids] = new_pos
++        if self._brain_mode():
++            self._brain.sample(mask, full_pos, self._site(), float(self.cfg.attacker_difficulty))
++        if self._feed is not None:
++            self._feed.reset_mask(mask, full_pos)
+         self._prev_distance[env_ids] = self.cfg.spawn_radius
++        self._closing_blackout[env_ids] = 2
++
++    def _respawn_attackers(self, env_ids: torch.Tensor) -> None:
++        """Send a fresh wave into the listed environments, leaving defenders as they are."""
++        if len(env_ids) == 0:
++            return
++        self._place_attackers(env_ids, only_active=True)
+ 
+     def _reset_idx(self, env_ids: Sequence[int] | None):
+         if env_ids is None:
+             env_ids = self._defenders[0]._ALL_INDICES
+-        super()._reset_idx(env_ids)
++        self._observing_terminal = True  # the mixin snapshots observations inside super()._reset_idx
++        try:
++            super()._reset_idx(env_ids)
++        finally:
++            self._observing_terminal = False
++        env_ids = torch.as_tensor(env_ids, device=self.device)
+         num = len(env_ids)
+         origins = self.scene.env_origins[env_ids]
++        D, A = self.cfg.num_defenders, self.cfg.num_attackers
+ 
+         # defenders start on a ring around the site
++        if self._cascade is not None:
++            rows = (env_ids.unsqueeze(-1) * D + torch.arange(D, device=self.device)).flatten()
++            self._cascade.reset(rows, randomize=True)
++        base = sample_uniform(0.0, 2 * math.pi, (num,), self.device)
+         for i, drone in enumerate(self._defenders):
+-            angle = sample_uniform(0.0, 6.2832, (num,), self.device)
++            if self._defenders_can_die:
++                # evenly spaced (+-0.3 rad jitter) so no two defenders spawn inside collide_radius
++                angle = base + i * 2 * math.pi / D + sample_uniform(-0.3, 0.3, (num,), self.device)
++            else:
++                angle = sample_uniform(0.0, 2 * math.pi, (num,), self.device)
+             state = drone.data.default_root_state[env_ids].clone()
+             state[:, 0] = origins[:, 0] + self.cfg.defender_radius * torch.cos(angle)
+             state[:, 1] = origins[:, 1] + self.cfg.defender_radius * torch.sin(angle)
+             state[:, 2] = origins[:, 2] + sample_uniform(1.0, 2.0, (num,), self.device)
++            if self.cfg.spawn_random_yaw:
++                yaw = sample_uniform(-math.pi, math.pi, (num,), self.device)
++                zeros = torch.zeros_like(yaw)
++                state[:, 3:7] = quat_from_euler_xyz(zeros, zeros, yaw)
+             state[:, 7:] = 0.0
+             drone.write_root_pose_to_sim(state[:, :7], env_ids)
+             drone.write_root_velocity_to_sim(state[:, 7:], env_ids)
+             self._defender_ctl[i].reset(env_ids)
++        self._defender_alive[env_ids] = True
+ 
+-        # attackers enter from a wider ring
+-        for i, drone in enumerate(self._attackers):
+-            angle = sample_uniform(0.0, 6.2832, (num,), self.device)
+-            state = drone.data.default_root_state[env_ids].clone()
+-            state[:, 0] = origins[:, 0] + self.cfg.spawn_radius * torch.cos(angle)
+-            state[:, 1] = origins[:, 1] + self.cfg.spawn_radius * torch.sin(angle)
+-            state[:, 2] = origins[:, 2] + sample_uniform(1.5, 3.0, (num,), self.device)
+-            state[:, 7:] = 0.0
+-            drone.write_root_pose_to_sim(state[:, :7], env_ids)
+-            drone.write_root_velocity_to_sim(state[:, 7:], env_ids)
+-            self._attacker_ctl[i].reset(env_ids)
++        # how many attackers fly this episode; the rest are parked and masked
++        if self.cfg.active_attackers is None:
++            self._attacker_active[env_ids] = True
++        else:
++            lo, hi = int(self.cfg.active_attackers[0]), int(self.cfg.active_attackers[1])
++            n_act = torch.randint(lo, hi + 1, (num,), device=self.device)
++            self._attacker_active[env_ids] = torch.arange(A, device=self.device).unsqueeze(0) < n_act.unsqueeze(-1)
++        if self._feed is not None:
++            # every lag is resampled; the slots are re-seeded in _place_attackers
++            self._feed.reset(env_ids, torch.zeros(self.num_envs, A, 3, device=self.device))
++        self._place_attackers(env_ids, only_active=False)
+ 
+-        self._attacker_alive[env_ids] = True
+-        self._attacker_speed[env_ids] = sample_uniform(
+-            self.cfg.attacker_speed[0], self.cfg.attacker_speed[1], (num, self.cfg.num_attackers), self.device
+-        )
+         self._breached[env_ids] = False
+         self._episode_captures[env_ids] = 0.0
+         for agent in self.cfg.possible_agents:
+             self._actions[agent][env_ids] = 0.0
+-        self._prev_distance[env_ids] = self.cfg.spawn_radius
++        self.assignment_switches[env_ids] = 0.0
++        for v in self._ep_terms.values():
++            v[env_ids] = 0.0
++        for v in self._ep_stats.values():
++            v[env_ids] = 0.0
++        self._ep_min_dist[env_ids] = float("inf")
+ 
+     def _debug_vis_callback(self, event):
+-        site = self.scene.env_origins.clone()
+-        self._site_markers.visualize(site)
++        self._site_markers.visualize(self.scene.env_origins.clone())
+diff --git a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/tello_defend_env_cfg.py b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/tello_defend_env_cfg.py
+index 428f711..f6882de 100644
+--- a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/tello_defend_env_cfg.py
++++ b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_defend/tello_defend_env_cfg.py
+@@ -9,16 +9,22 @@ from isaaclab.scene import InteractiveSceneCfg
+ from isaaclab.sim import SimulationCfg
+ from isaaclab.utils import configclass
+ 
+-from action_space_kit.control import TelloCommandCfg
++from action_space_kit.control import TelloCommandCfg, TelloDynamicsCfg
+ 
+ NUM_DEFENDERS = 2
+ NUM_ATTACKERS = 2
+ 
+-# obs per defender: own pos rel. site (3) + own vel (3) + gravity (3)
+-#                 + per attacker (rel pos 3, rel vel 3, visible flag 1)
++# obs per defender: own pos rel. site (3) + own vel (3) + gravity (3) [+ heading sin/cos (2)]
++#                 [+ per teammate (rel pos 3, rel vel 3, alive 1)]
++#                 + per attacker slot (rel pos 3, rel vel 3, valid flag 1)
+ _OBS_DIM = 9 + 7 * NUM_ATTACKERS
+ 
+ 
++def obs_dim(cfg) -> int:
++    """Observation size for a cfg (recomputed by the env, so hydra overrides of team sizes work)."""
++    return 9 + (2 if cfg.obs_heading else 0) + (7 * (cfg.num_defenders - 1) if cfg.obs_teammates else 0) + 7 * cfg.num_attackers
++
++
+ @configclass
+ class TelloDefendEnvCfg(DirectMARLEnvCfg):
+     """Defenders intercept attackers before they reach the protected site.
+@@ -83,3 +89,207 @@ class TelloDefendEnvCfg(DirectMARLEnvCfg):
+     rew_scale_breach = -20.0  # an attacker reaching the site (shared)
+     rew_scale_effort = -0.01
+     rew_scale_alive = 0.1
++
++    # - target assignment (ws-assign-reward). Defaults reproduce the stock "nearest" task.
++    assignment = "nearest"
++    """Who each defender's closing/proximity terms point at.
++
++    ``nearest``: the closest live attacker (stock; both defenders often pick the same one).
++    ``minmax_ttg``: joint assignment minimising the slowest lead-intercept time, then the total,
++    with every live attacker covered (same rule as the assign-* baselines).
++    ``min_sum_ttg``: joint assignment minimising the total time-to-go.
++    """
++    assignment_hysteresis = 0.3  # [s] keep the current assignment unless an alternative is this much faster
++    obs_assigned_first = False
++    """Reorder the attacker slots per defender: assigned target first, the rest by time-to-go.
++    The obs size is unchanged, but the slot meaning is not, so old checkpoints won't transfer."""
++    rew_capture_team_share = 0.0
++    """beta in capture = w*((1-beta)*own + beta*team/N): share part of each capture with the whole team,
++    so a defender that blocks or herds still gets paid. 0 = stock (own captures only)."""
++
++    # ===================== ws-defend-env additions (defaults reproduce AS-Defend-v0) =====================
++    # - team / slots
++    active_attackers: list | None = None
++    """[lo, hi] attackers actually flying per episode; the rest are parked (masked out). None = all."""
++    obs_teammates = False  # add the other defenders (rel pos, rel vel, alive) to each observation
++    obs_heading = False  # add sin/cos(yaw); needed later for FOV-limited (vision) sensing
++
++    # - take-down
++    capture_mode = "radius"
++    """``radius``: within capture_radius (legacy). ``ram``: within capture_radius AND closing faster than
++    ram_min_speed; the attacker then falls (motors off), like a real collision take-down."""
++    ram_min_speed = 0.3  # [m/s]
++    defender_loss_prob = 0.0  # chance our defender also goes down on a ram
++
++    # - scripted attackers
++    attacker_difficulty: float = -1.0
++    """< 0 = legacy (attacker_speed + attacker_evasion). Else [0,1] slider, see attackers.py.
++    (Not None: Isaac Lab's hydra from_dict type-checks against the default, so None knobs can't be overridden.)"""
++    attacker_max_speed = 1.0  # [m/s] attacker velocity cap
++    evade_radius = 1.5  # [m] reactive evaders sidestep defenders inside this
++
++    # - Tello realism
++    dynamics_model = "velocity"
++    """``velocity``: TelloVelocityController (simple lag, fast physics). ``cascade``: randomized Tello firmware
++    model (TelloCascadeController, as in Approach/Room); needs ~500 Hz physics."""
++    dynamics: TelloDynamicsCfg = TelloDynamicsCfg()
++    spawn_random_yaw = False
++    feed_model = False
++    """Attackers observed through a delayed / noisy / dropping position feed + alpha-beta filter (feed.py)."""
++    feed_delay_s = [0.0, 0.3]  # [s] per-episode lag range
++    feed_noise = 0.03  # [m]
++    feed_dropout = 0.1
++    feed_alpha = 0.5
++    feed_beta = 0.2
++    own_pos_noise = 0.0  # [m] noise on our own (AprilTag) positions in obs
++    own_vel_noise = 0.0  # [m/s]
++
++    # - safety / bounds (None = off, legacy)
++    crash_z_min: float | None = None  # [m] below this a defender has crashed
++    crash_z_max: float | None = None
++    arena_radius: float | None = None  # [m] horizontal geofence from the site
++    collide_radius: float | None = None  # [m] two defenders closer than this both go down
++    separation_radius = 0.6  # [m] separation penalty starts here (dense mode)
++
++    # - reward
++    reward_mode = "legacy"
++    """``legacy``: original terms. ``dense``: potential-based closing (gamma*phi' - phi, can't be exploited)
++    + events. ``sparse``: +1 per capture (team), +0.5 wave cleared, -1 breach, -0.5 own crash."""
++    shaping_scale = 1.0  # multiplies the dense shaping; anneal towards 0 along the curriculum
++    shaping_gamma = 1.0  # 1.0 = pure telescoping closing. <1 pays (1-gamma)*distance per step for standing still far away (measured: +54/episode at stage 0)
++    rew_scale_crash = -10.0
++    rew_scale_separation = -2.0  # per second, times (separation_radius - distance)
++
++    # - curriculum
++    curriculum_stage: int = -1
++    """-1 = off. Else apply a preset from CURRICULUM (see below) at env construction. It OVERRIDES the fields it sets, and the
++    physics: stages 0-3 = velocity model at 120 Hz (fast), 4-6 = cascade firmware model at 500 Hz (realistic)."""
++    physics_preset = "auto"
++    """Physics used with curriculum_stage >= 0. ``auto``: stages 0-3 fast, 4-6 real (as before). ``fast``: velocity model
++    at 120 Hz for every stage; from stage 4 on it also gets FAST_DR (lag / accel / latency fitted to the cascade model,
++    randomized per episode). ``real``: cascade firmware model at 500 Hz for every stage."""
++
++    # - fast-model randomization (velocity model only; empty list = off, the plain TelloVelocityController)
++    fast_response_time: list = []
++    """[lo, hi] s: per-episode first-order lag of the velocity model (both the command filter and the tracking loop)."""
++    fast_response_time_z: list = []
++    """[lo, hi] s: vertical tau (defaults to fast_response_time when empty)."""
++    fast_max_accel: list = []
++    """[lo, hi] m/s^2: per-episode horizontal acceleration clamp."""
++    fast_max_accel_z: list = []
++    """[lo, hi] m/s^2: per-episode vertical acceleration clamp (defaults to fast_max_accel when empty)."""
++    fast_latency_steps: list = []
++    """Policy steps of command delay, sampled per episode from this list (like TelloDynamicsCfg.latency_steps)."""
++
++
++@configclass
++class TelloDefendAssignEnvCfg(TelloDefendEnvCfg):
++    """Defend with a joint target assignment in the reward and observation (AS-Defend-Assign-v0).
++
++    Closing/proximity point at the defender's assigned attacker. Slot 0 of the observation
++    is that attacker. Capture reward is half shared, so covering for a teammate pays.
++    """
++
++    assignment = "minmax_ttg"
++    obs_assigned_first = True
++    rew_capture_team_share = 0.5
++
++
++# Curriculum presets for AS-Defend-Live-v0 (3 defenders, 4 attacker slots throughout, so one
++# network carries over between stages). Gate to advance: see docs/TRAINING_PLAN.md §3.2.
++CURRICULUM: dict[int, dict] = {
++    0: dict(active_attackers=[1, 1], attacker_difficulty=-1.0, attacker_speed=[0.0, 0.0], spawn_radius=3.5,
++            capture_mode="radius", capture_radius=0.8, feed_model=False, shaping_scale=1.0, defender_loss_prob=0.0),
++    1: dict(active_attackers=[1, 2], attacker_difficulty=0.0, spawn_radius=4.5,
++            capture_mode="radius", capture_radius=0.6, feed_model=False, shaping_scale=1.0, defender_loss_prob=0.0),
++    2: dict(active_attackers=[2, 2], attacker_difficulty=0.2, spawn_radius=6.0,
++            capture_mode="radius", capture_radius=0.4, feed_model=False, shaping_scale=1.0, defender_loss_prob=0.0),
++    3: dict(active_attackers=[2, 2], attacker_difficulty=0.3, spawn_radius=6.0,
++            capture_mode="ram", capture_radius=0.25, feed_model=False, shaping_scale=0.5, defender_loss_prob=0.0),
++    4: dict(active_attackers=[2, 3], attacker_difficulty=0.4, spawn_radius=6.0,
++            capture_mode="ram", capture_radius=0.25, feed_model=True, own_pos_noise=0.02, own_vel_noise=0.05,
++            shaping_scale=0.3, defender_loss_prob=0.0),
++    5: dict(active_attackers=[2, 3], attacker_difficulty=0.6, spawn_radius=6.0,
++            capture_mode="ram", capture_radius=0.25, feed_model=True, own_pos_noise=0.02, own_vel_noise=0.05,
++            shaping_scale=0.1, defender_loss_prob=0.2),
++    6: dict(active_attackers=[2, 4], attacker_difficulty=0.9, spawn_radius=6.0,
++            capture_mode="ram", capture_radius=0.25, feed_model=True, own_pos_noise=0.02, own_vel_noise=0.05,
++            shaping_scale=0.1, defender_loss_prob=0.3),
++}
++
++
++# Physics per stage. The cascade firmware model needs 500 Hz physics and is overhead-bound at ~30 ms per physics
++# step, so stages 0-3 use the simple velocity model at 120 Hz (4x fewer physics steps). The policy rate stays
++# ~13.4 Hz throughout (120/9 = 13.3, 500/37 = 13.5), so a checkpoint carries over; stage 4 is where the realistic
++# firmware model, latency and feed lag all switch on.
++FAST_PHYSICS = dict(dynamics_model="velocity", dt=1 / 120, decimation=9)
++REAL_PHYSICS = dict(dynamics_model="cascade", dt=1 / 500, decimation=37)
++
++
++# Fast-model stand-in for the cascade firmware model (stages >= 4 with physics_preset="fast").
++# Fitted to cascade step responses, see docs/BRIEF_FAST_ENV.md "Deliverable A: fit".
++# Cascade fit (384 drones, 20 s random steps): xy tau p10-p75 0.22-0.30 s (median 0.26), accel 2-4.5 m/s^2;
++# z tau 0.12-0.15 s, accel 2.5-8 m/s^2. Fitted rms 0.037 m/s vs 0.105 for the old nominal (0.15 s, 4 m/s^2).
++FAST_DR = dict(fast_response_time=[0.22, 0.32], fast_max_accel=[2.0, 4.5], fast_response_time_z=[0.12, 0.18],
++               fast_max_accel_z=[3.5, 8.0], fast_latency_steps=[0, 1, 2])
++
++
++def apply_curriculum(cfg, stage: int) -> None:
++    for k, v in CURRICULUM[stage].items():
++        setattr(cfg, k, v)
++    preset = getattr(cfg, "physics_preset", "auto")
++    if preset not in ("auto", "fast", "real"):
++        raise ValueError(f"unknown physics_preset {preset!r}")
++    if preset == "auto":
++        phys = FAST_PHYSICS if stage <= 3 else REAL_PHYSICS
++    else:
++        phys = FAST_PHYSICS if preset == "fast" else REAL_PHYSICS
++        if preset == "fast" and stage >= 4:
++            for k, v in FAST_DR.items():
++                setattr(cfg, k, list(v))
++    cfg.dynamics_model = phys["dynamics_model"]
++    cfg.sim.dt = phys["dt"]
++    cfg.decimation = phys["decimation"]
++    cfg.sim.render_interval = phys["decimation"]
++    if cfg.arena_radius is not None:
++        cfg.arena_radius = max(cfg.arena_radius, cfg.spawn_radius + 3.0)
++
++
++@configclass
++class TelloDefendLiveEnvCfg(TelloDefendAssignEnvCfg):
++    """The day-of setup (AS-Defend-Live-v0): 3 defenders, up to 4 attackers, ram take-downs, Tello firmware
++    model at the real rc rate, crash bounds, teammates + heading in obs. Defaults = curriculum stage 3
++    without feed noise; set ``env.curriculum_stage=k`` for a preset.
++    """
++
++    # policy at 500/37 = 13.5 Hz (Tello rc over WiFi), physics + firmware model at 500 Hz
++    decimation = 37
++    sim: SimulationCfg = SimulationCfg(dt=1 / 500, render_interval=37)
++    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=2048, env_spacing=20.0, replicate_physics=True)
++
++    num_defenders = 3
++    num_attackers = 4
++    possible_agents = [f"defender_{i}" for i in range(3)]
++    action_spaces = {f"defender_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(3)}
++    observation_spaces = {f"defender_{i}": 9 + 2 + 14 + 28 for i in range(3)}
++
++    active_attackers = [2, 2]
++    obs_teammates = True
++    obs_heading = True
++    capture_mode = "ram"
++    capture_radius = 0.25
++    attacker_difficulty = 0.3
++    attacker_max_speed = 1.3
++    dynamics_model = "cascade"
++    spawn_random_yaw = True
++    crash_z_min = 0.15
++    crash_z_max = 4.0
++    arena_radius = 9.0
++    collide_radius = 0.2
++    reward_mode = "dense"
++    rew_scale_closing = 5.0
++    rew_scale_capture = 30.0
++    rew_scale_cleared = 30.0
++    rew_scale_breach = -20.0
++    rew_scale_effort = -0.01
++    rew_capture_team_share = 0.5
+diff --git a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_hover/tello_hover_env.py b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_hover/tello_hover_env.py
+index 1c254f1..f6f2cb6 100644
+--- a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_hover/tello_hover_env.py
++++ b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_hover/tello_hover_env.py
+@@ -11,7 +11,7 @@ from isaaclab.assets import RigidObject
+ from isaaclab.envs import DirectRLEnv
+ from isaaclab.markers import CUBOID_MARKER_CFG, VisualizationMarkers
+ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+-from isaaclab.utils.math import sample_uniform
++from isaaclab.utils.math import quat_apply_inverse, sample_uniform
+ 
+ from action_space_kit.assets import TELLO_MASS
+ from action_space_kit.control import TelloVelocityController
+@@ -66,7 +66,11 @@ class TelloHoverEnv(DirectRLEnv):
+             projected_gravity_b=self._robot.data.projected_gravity_b,
+             dt=self.physics_dt,
+         )
+-        self._robot.set_external_force_and_torque(forces=force_w, torques=torque_b, body_ids=[0])
++        # The controller returns a world-frame force, but set_external_force_and_torque applies
++        # forces in the body frame by default. Unrotated, any yaw turns the thrust with the body
++        # and the velocity loop goes unstable once yaw passes ~90 degrees.
++        force_b = quat_apply_inverse(self._robot.data.root_quat_w, force_w.squeeze(1)).unsqueeze(1)
++        self._robot.set_external_force_and_torque(forces=force_b, torques=torque_b, body_ids=[0])
+ 
+     def _get_observations(self) -> dict:
+         goal_error_w = self._goal_pos_w - self._robot.data.root_pos_w
+diff --git a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_waypoint/tello_waypoint_env.py b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_waypoint/tello_waypoint_env.py
+index 244a200..bc021e6 100644
+--- a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_waypoint/tello_waypoint_env.py
++++ b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_waypoint/tello_waypoint_env.py
+@@ -18,6 +18,8 @@ class TelloWaypointEnv(TelloHoverEnv):
+     cfg: TelloWaypointEnvCfg
+ 
+     def __init__(self, cfg: TelloWaypointEnvCfg, render_mode: str | None = None, **kwargs):
++        if cfg.obs_goal_vel:
++            cfg.observation_space = 15
+         super().__init__(cfg, render_mode, **kwargs)
+         self._goal_vel_w = torch.zeros(self.num_envs, 3, device=self.device)
+         self._goal_resample_steps = max(int(self.cfg.goal_resample_time_s / self.step_dt), 1)
+@@ -51,6 +53,19 @@ class TelloWaypointEnv(TelloHoverEnv):
+         self._goal_vel_w[low | high, 2] *= -1.0
+         self._goal_pos_w = local + self.scene.env_origins
+ 
++    def _get_observations(self) -> dict:
++        obs = super()._get_observations()
++        if self.cfg.obs_goal_vel:
++            obs["policy"] = torch.cat([obs["policy"], self._goal_vel_w], dim=-1)
++        return obs
++
++    def _get_rewards(self) -> torch.Tensor:
++        rewards = super()._get_rewards()
++        if self.cfg.rew_scale_precision:
++            distance = torch.linalg.norm(self._goal_pos_w - self._robot.data.root_pos_w, dim=-1)
++            rewards = rewards + self.cfg.rew_scale_precision * torch.exp(-distance / self.cfg.precision_sigma) * self.step_dt
++        return rewards
++
+     def _reset_idx(self, env_ids: Sequence[int] | None):
+         super()._reset_idx(env_ids)
+         if env_ids is None or len(env_ids) == self.num_envs:
+diff --git a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_waypoint/tello_waypoint_env_cfg.py b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_waypoint/tello_waypoint_env_cfg.py
+index fbd9dde..bae9968 100644
+--- a/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_waypoint/tello_waypoint_env_cfg.py
++++ b/simulation_infra/source/action_space_kit/action_space_kit/tasks/direct/tello_waypoint/tello_waypoint_env_cfg.py
+@@ -27,3 +27,8 @@ class TelloWaypointEnvCfg(TelloHoverEnvCfg):
+     rew_scale_distance = 10.0
+     rew_scale_lin_vel = -0.01
+     max_distance = 4.0
++
++    # - improvements (ws-basic-tasks), all off by default so old checkpoints/configs are unchanged
++    obs_goal_vel = False  # append the goal velocity (3) to obs -> 15 dims; lets the policy lead the goal
++    rew_scale_precision = 0.0  # extra reward scale * exp(-d / precision_sigma): sharp pull in the last ~20 cm
++    precision_sigma = 0.1  # [m]

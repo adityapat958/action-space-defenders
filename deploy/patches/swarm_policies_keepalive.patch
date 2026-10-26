@@ -1,0 +1,42 @@
+--- /tmp/swarm_policies_upstream.py	2026-10-24 13:59:41.852781467 -0400
++++ /tmp/swarm_policies_patched.py	2026-10-24 13:59:58.291805544 -0400
+@@ -171,7 +171,7 @@
+     def takeoff(self):
+         self.airborne = True
+         for _ in range(2):
+-            if self.send("takeoff", 20) == "ok":
++            if self.send("takeoff", 8) == "ok":
+                 self.takeoff_t = time.time()
+                 return True
+             if not self.on_ground():           # reply lost but it's up
+@@ -444,10 +444,29 @@
+             for e in externals:
+                 e.answer("FLY")
+ 
++            # team4 keepalive: send rc 0 0 0 0 every 1 s while drones take off
++            # so airborne drones don't auto-land after 15 s during staggered takeoffs
++            _keepalive_stop = threading.Event()
++            _airborne_set: list = []
++            def _keepalive():
++                while not _keepalive_stop.is_set():
++                    for _kd in list(_airborne_set):
++                        try:
++                            _kd.send_noreply("rc 0 0 0 0")
++                        except Exception:
++                            pass
++                    time.sleep(1.0)
++            _kthread = threading.Thread(target=_keepalive, daemon=True, name="keepalive")
++            _kthread.start()
++
+             def to(d):
+                 time.sleep(TAKEOFF_STAGGER_S * drones.index(d))
+-                return d.takeoff()
++                ok = d.takeoff()
++                if ok and not d.on_ground():
++                    _airborne_set.append(d)
++                return ok
+             res = parallel(drones, to)
++            _keepalive_stop.set()
+             if not all(res.get(d.num) for d in drones):
+                 print("A takeoff failed -> landing all", flush=True)
+                 return

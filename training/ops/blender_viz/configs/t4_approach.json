@@ -1,0 +1,10 @@
+{
+ "name": "t4_approach",
+ "npz": "docs/results/blender_viz/data/t4_approach_r2_seed7.npz",
+ "env": 0,
+ "title": "T4 Approach - shared PPO policy (round 2), 4 drones through gates to pads",
+ "trails": "history",
+ "speed": 1.0,
+ "grid": 1.0,
+ "drone_scale": 3.0
+}

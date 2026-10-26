@@ -1,0 +1,94 @@
+{
+ "npz": "<render-dir>/docs/results/blender_viz/data/t4_approach_r2_seed7.npz",
+ "samples": 178,
+ "dt": 0.05,
+ "fps": 30,
+ "speed": 1.0,
+ "agents": {
+  "drone_0": {
+   "role": "agent",
+   "team_material": "viz_team_agent",
+   "max_pos_err_m": 0.0,
+   "max_rot_err_deg": 0.035428646972335796,
+   "visibility_mismatches": 0,
+   "orientation": "sim (Isaac root_quat_w)"
+  },
+  "drone_1": {
+   "role": "agent",
+   "team_material": "viz_team_agent",
+   "max_pos_err_m": 0.0,
+   "max_rot_err_deg": 0.033445655271836475,
+   "visibility_mismatches": 0,
+   "orientation": "sim (Isaac root_quat_w)"
+  },
+  "drone_2": {
+   "role": "agent",
+   "team_material": "viz_team_agent",
+   "max_pos_err_m": 0.0,
+   "max_rot_err_deg": 0.031488525032373954,
+   "visibility_mismatches": 0,
+   "orientation": "sim (Isaac root_quat_w)"
+  },
+  "drone_3": {
+   "role": "agent",
+   "team_material": "viz_team_agent",
+   "max_pos_err_m": 0.0,
+   "max_rot_err_deg": 0.03872315851647906,
+   "visibility_mismatches": 0,
+   "orientation": "sim (Isaac root_quat_w)"
+  }
+ },
+ "checks": {
+  "max_pos_err_m": 0.0,
+  "max_rot_err_deg": 0.03872315851647906,
+  "all_attackers_red": true,
+  "all_defenders_green": true,
+  "role_rgb": {
+   "attacker": [
+    0.9,
+    0.06,
+    0.05
+   ],
+   "defender": [
+    0.05,
+    0.78,
+    0.12
+   ],
+   "agent": [
+    0.05,
+    0.78,
+    0.12
+   ]
+  },
+  "frame_of_last_sample": 266.5,
+  "frame_end": 312,
+  "sim_seconds": 8.85,
+  "video_seconds": 8.85,
+  "visibility_ok": true,
+  "regions": [
+   {
+    "kind": "keepout",
+    "center": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "radius": 3.0
+   },
+   {
+    "kind": "touchdown",
+    "center": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "radius": 1.0
+   }
+  ],
+  "events": {
+   "gate": 4,
+   "landed": 3
+  }
+ },
+ "pass": true
+}

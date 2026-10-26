@@ -1,0 +1,101 @@
+{
+ "npz": "<render-dir>/docs/results/blender_viz/data/t3_defend_rl_sparse_s2_stage2_seed7.npz",
+ "samples": 270,
+ "dt": 0.07400000095367432,
+ "fps": 30,
+ "speed": 1.0,
+ "agents": {
+  "defender_0": {
+   "role": "defender",
+   "team_material": "viz_team_defender",
+   "max_pos_err_m": 0.0,
+   "max_rot_err_deg": 0.03538275478731603,
+   "visibility_mismatches": 0,
+   "orientation": "sim yaw (EnvWorld def_yaw; velocity model, no tilt)"
+  },
+  "defender_1": {
+   "role": "defender",
+   "team_material": "viz_team_defender",
+   "max_pos_err_m": 0.0,
+   "max_rot_err_deg": 0.034216739625151996,
+   "visibility_mismatches": 0,
+   "orientation": "sim yaw (EnvWorld def_yaw; velocity model, no tilt)"
+  },
+  "defender_2": {
+   "role": "defender",
+   "team_material": "viz_team_defender",
+   "max_pos_err_m": 0.0,
+   "max_rot_err_deg": 0.03323707301392187,
+   "visibility_mismatches": 0,
+   "orientation": "sim yaw (EnvWorld def_yaw; velocity model, no tilt)"
+  },
+  "attacker_0": {
+   "role": "attacker",
+   "team_material": "viz_team_attacker",
+   "max_pos_err_m": 0.0,
+   "max_rot_err_deg": null,
+   "visibility_mismatches": 0,
+   "orientation": "none (position-only)"
+  },
+  "attacker_1": {
+   "role": "attacker",
+   "team_material": "viz_team_attacker",
+   "max_pos_err_m": 0.0,
+   "max_rot_err_deg": null,
+   "visibility_mismatches": 0,
+   "orientation": "none (position-only)"
+  }
+ },
+ "checks": {
+  "max_pos_err_m": 0.0,
+  "max_rot_err_deg": 0.03538275478731603,
+  "all_attackers_red": true,
+  "all_defenders_green": true,
+  "role_rgb": {
+   "attacker": [
+    0.9,
+    0.06,
+    0.05
+   ],
+   "defender": [
+    0.05,
+    0.78,
+    0.12
+   ],
+   "agent": [
+    0.05,
+    0.78,
+    0.12
+   ]
+  },
+  "frame_of_last_sample": 598.1800076961517,
+  "frame_end": 644,
+  "sim_seconds": 19.90600025653839,
+  "video_seconds": 19.90600025653839,
+  "visibility_ok": true,
+  "regions": [
+   {
+    "kind": "site",
+    "center": [
+     3.0,
+     0.0,
+     0.0
+    ],
+    "radius": 1.5
+   },
+   {
+    "kind": "ring",
+    "center": [
+     3.0,
+     0.0,
+     0.0
+    ],
+    "radius": 6.0
+   }
+  ],
+  "events": {
+   "capture": 12
+  }
+ },
+ "pass": true
+}

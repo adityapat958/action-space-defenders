@@ -1,0 +1,13 @@
+{
+ "name": "t1_hover",
+ "npz": "docs/results/ws_basic/hover_B_fixedlr_noclip.npz",
+ "env": 0,
+ "title": "T1 Hover - RL policy (hover_B_fixedlr_noclip)",
+ "trails": "history",
+ "speed": 1.0,
+ "overview_elev": 22.0,
+ "drop_lines": true,
+ "grid": 0.1,
+ "fit_ground": false,
+ "trail_width": 0.0015
+}
