@@ -162,6 +162,14 @@ for the diffs applied to organizer env files.
 
 ---
 
+## Team
+
+- **Aditya Patwardhan** ([@adityapat958](https://github.com/adityapat958)): sim environments, RL training, deploy stack
+- **Aryan Shah** ([@Schrodingerrs-cat](https://github.com/Schrodingerrs-cat)): stage-7 defender policy (`policies/aryan_defend_rl_sparse_s7_c3`)
+- **Marika** ([@marika340](https://github.com/marika340)): collaborator
+
+---
+
 ## Licenses
 
 `deploy/`, `policies/`, `training/simulation_infra/source/…/tello_defend/` (our additions), and
