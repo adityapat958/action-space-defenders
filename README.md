@@ -10,9 +10,9 @@ RL-trained swarm of 3 Tello EDU drones that intercepts and downs attacking drone
 
 [![Real-flight run at Microsoft NERD](media/real_run.jpg)](media/action_space_sim2real.mp4)
 
-▶ [Watch the 48 s video](media/action_space_sim2real.mp4)
+▶ [Watch the 36 s video](media/action_space_sim2real.mp4)
 
-*48 s · sim rollouts → real-flight run at Microsoft NERD*
+*36 s · real-flight run at Microsoft NERD → the same policy in sim*
 
 ![3v2 defend trajectory](plots/defend_s2_3v2_3d.png)
 ![curriculum training stages](plots/fig_defend_stages.png)
